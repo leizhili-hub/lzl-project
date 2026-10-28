@@ -1,0 +1,481 @@
+From aa898e1ae8f4ba4d7243c8b553ef38ec0a519c0d Mon Sep 17 00:00:00 2001
+From: liuyi <ly0924171@gmail.com>
+Date: Wed, 28 Oct 2026 13:40:52 +0800
+Subject: [PATCH] =?UTF-8?q?feat(testcases):=20=E7=94=A8=E4=BE=8B=E9=A1=B5?=
+ =?UTF-8?q?=E6=94=AF=E6=8C=81=E6=8C=89=E6=9D=A5=E6=BA=90=E7=94=BB=E5=B8=83?=
+ =?UTF-8?q?/=E6=96=87=E4=BB=B6=E5=A4=B9=E7=AD=9B=E9=80=89=20+=20=E4=BF=AE?=
+ =?UTF-8?q?=E5=A4=8D=E5=8A=9F=E8=83=BD=E6=A8=A1=E5=9D=97=E4=B8=8B=E6=8B=89?=
+ =?UTF-8?q?=E7=AD=9B=E4=B8=8D=E5=88=B0=E7=9A=84=E9=97=AE=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题：墨刀用例按模块采纳后，在测试用例页按「功能模块」筛不到想要看的模块。
+
+根因：
+1. 两个页面的「模块」不是同一套：采纳页按 AI 生成的 module 自由文本筛选；
+   用例页按 feature_modules 注册表（M2M）按 id 精确关联；
+2. 入库时模块名经 _canonical_module_name 模糊归并（cutoff=0.6），
+   AI 原文（如「运动连胜-入口」）可能被改名（如「连胜-入口」），名字对不上；
+3. 用例页选版本后的分组逻辑只保留「已关联该版本」与「完全无版本」的模块，
+   关联了其他版本的模块被整个丢弃，下拉里直接消失；
+4. 来源画布/来源文件夹在采纳时根本没有落库，无法按来源筛选。
+
+改动（不涉及数据库字段，无迁移文件）：
+- modao_views: 采纳时把来源写入已有 tags 字段（画布:P{n} {name} / 文件夹:{folder}），
+  冒烟用例 ref 被置空，改用前端显式 source_page_id 兜底；5 个采纳入口均覆盖
+- testcases/views + urls: tags 参数支持逗号分隔多标签（且关系）；
+  新增 GET /api/testcases/source-tags/ 聚合当前项目+版本下的来源标签选项
+- feature_modules/views: 新增 used_with_version 参数，返回该版本下用例实际关联的模块
+- TestCaseList.vue: 功能模块下拉支持输入搜索；新增「✅ 本版本用例在用」置顶分组；
+  新增「关联了其他版本」分组（修复模块被丢弃）；顶部新增来源画布/来源文件夹两个筛选
+- CaseMergeView.vue: 采纳请求带 source_page_id
+
+验证（容器内，事务回滚不落库）：采纳写出 tags=['画布:P17 连胜状态','文件夹:连胜']；
+version=31(轻练1.2.1) 返回本版本在用模块 10 个；各接口 200。
+---
+ apps/feature_modules/views.py                 |  6 ++
+ apps/requirement_analysis/modao_views.py      | 49 ++++++++--
+ apps/testcases/urls.py                        |  1 +
+ apps/testcases/views.py                       | 33 ++++++-
+ .../requirement-analysis/CaseMergeView.vue    |  6 +-
+ frontend/src/views/testcases/TestCaseList.vue | 98 +++++++++++++++++--
+ 6 files changed, 178 insertions(+), 15 deletions(-)
+
+diff --git a/apps/feature_modules/views.py b/apps/feature_modules/views.py
+index 5c7eef4..aadc827 100644
+--- a/apps/feature_modules/views.py
++++ b/apps/feature_modules/views.py
+@@ -29,6 +29,12 @@ class FeatureModuleListCreateView(ProjectScopedMixin, generics.ListCreateAPIView
+         version_id = self.request.query_params.get('version_id')
+         if version_id:
+             qs = qs.filter(versions__id=version_id)
++        # used_with_version=<vid>：返回该版本下至少被一条用例实际关联的模块。
++        # 供测试用例页的功能模块下拉优先展示「真实在用」的模块（修复按版本分组时
++        # 部分已用模块因归属其他版本而整个消失、用户筛不到的问题）。
++        used_with_version = self.request.query_params.get('used_with_version')
++        if used_with_version:
++            qs = qs.filter(testcases__versions__id=used_with_version)
+         return qs.distinct()
+ 
+     def perform_create(self, serializer):
+diff --git a/apps/requirement_analysis/modao_views.py b/apps/requirement_analysis/modao_views.py
+index 9e6d009..e55f97e 100644
+--- a/apps/requirement_analysis/modao_views.py
++++ b/apps/requirement_analysis/modao_views.py
+@@ -484,14 +484,43 @@ def _resolve_adopt_version(proto):
+     return None
+ 
+ 
++def _source_page_of(proto, entry, ref=None, explicit_id=None):
++    """取来源画布（ModaoPage），用于采纳时写入来源 tags。
++
++    优先级：显式 source_page_id > entry.page_id > ref.page_id。
++    冒烟用例的 ref 被前端故意置空（防止误命中同页普通用例），
++    需靠显式 source_page_id 兜底。
++    """
++    page_id = explicit_id
++    if page_id is None and entry and entry.get('page_id') is not None:
++        page_id = entry['page_id']
++    if page_id is None and isinstance(ref, dict) and ref.get('page_id') is not None:
++        page_id = ref.get('page_id')
++    if page_id is None:
++        return None
++    try:
++        return proto.pages.filter(id=int(page_id)).first()
++    except (TypeError, ValueError):
++        return None
++
++
+ def _adopt_one_case(proto, user, tc_obj, mname, sort_order, desc_suffix='逐条采纳',
+-                    extra_tags=None, source='ai'):
++                    extra_tags=None, source='ai', source_page=None):
+     """把一条（可能已被前端编辑过的）用例写入用例库。幂等：项目 + 标题 + 模块 去重。
+ 
+     source：用例来源（'ai'=AI生成 / 'manual'=人工编写）。
+     人工补充（_manual / 无 _ref）必须传 'manual'，否则用例库来源列会错标成「AI生成」，
+     进而污染 AI 采纳率 / 真实覆盖率统计。
++    source_page：来源画布（ModaoPage），采纳时把来源画布/文件夹写入 tags 供溯源筛选。
+     """
++    # 来源溯源：把来源画布/文件夹写入 tags（tags 是已有 JSONField，不涉及迁移）。
++    # 格式：画布:P{page_no} {page_name} / 文件夹:{folder}，供测试用例页按来源筛选。
++    if source_page is not None:
++        origin_tags = [f"画布:P{source_page.page_no} {source_page.page_name}"]
++        _folder = (getattr(source_page, 'folder', '') or '').strip()
++        if _folder:
++            origin_tags.append(f"文件夹:{_folder}")
++        extra_tags = list(dict.fromkeys(list(extra_tags or []) + origin_tags))
+     if not proto.project_id:
+         return {'ok': False, 'detail': '请先在阶段0关联项目，再采纳到用例库'}
+     target_version = _resolve_adopt_version(proto)
+@@ -1787,13 +1816,15 @@ def modao_adopt(request, pk):
+             is_smoke = bool(data.pop('is_smoke', False))
+             # 人工补充（无 _ref / 显式 _manual）：不是"编辑某条 AI 用例"，需并入汇总
+             is_manual = bool(data.pop('_manual', False)) or not ref
++            src_page_id = data.pop('source_page_id', None)
+             entry = _find_case_entry(entries, ref)
+             sort_order = entry['ordinal'] if entry else len(entries) + i + 1
+             mname = data.get('module') or (entry['module'] if entry else '未分组')
+             r = _adopt_one_case(proto, request.user, data, mname, sort_order,
+                                 desc_suffix='人工补充采纳' if is_manual else '编辑后采纳',
+                                 extra_tags=['冒烟'] if is_smoke else None,
+-                                source='manual' if is_manual else 'ai')
++                                source='manual' if is_manual else 'ai',
++                                source_page=_source_page_of(proto, entry, ref=ref, explicit_id=src_page_id))
+             if not r.get('ok'):
+                 counts['failed'] += 1
+                 continue
+@@ -1815,7 +1846,8 @@ def modao_adopt(request, pk):
+                 counts['failed'] += 1
+                 continue
+             r = _adopt_one_case(proto, request.user, entry['tc_obj'], entry['module'],
+-                                entry['ordinal'], desc_suffix='逐条采纳')
++                                entry['ordinal'], desc_suffix='逐条采纳',
++                                source_page=_source_page_of(proto, entry, ref=ref))
+             if not r.get('ok'):
+                 counts['failed'] += 1
+                 continue
+@@ -1856,7 +1888,8 @@ def _adopt_single_case(proto, user, case_index):
+     if not isinstance(case_index, int) or case_index < 0 or case_index >= len(entries):
+         return {'ok': False, 'detail': f'用例索引 {case_index} 超出范围（共 {len(entries)} 条）'}
+     e = entries[case_index]
+-    return _adopt_one_case(proto, user, e['tc_obj'], e['module'], e['ordinal'], desc_suffix='逐条采纳')
++    return _adopt_one_case(proto, user, e['tc_obj'], e['module'], e['ordinal'], desc_suffix='逐条采纳',
++                           source_page=_source_page_of(proto, e))
+ 
+ 
+ @api_view(['POST'])
+@@ -1892,7 +1925,9 @@ def modao_adopt_single(request, pk):
+         mname = edited.get('module') or (entry['module'] if entry else '未分组')
+         result = _adopt_one_case(proto, request.user, edited, mname, sort_order,
+                                  desc_suffix='编辑后采纳',
+-                                 extra_tags=['冒烟'] if is_smoke else None)
++                                 extra_tags=['冒烟'] if is_smoke else None,
++                                 source_page=_source_page_of(proto, entry, ref=ref,
++                                                             explicit_id=payload.get('source_page_id')))
+         if not result.get('ok'):
+             return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
+         return Response({
+@@ -1912,7 +1947,9 @@ def modao_adopt_single(request, pk):
+         )
+     result = _adopt_one_case(proto, request.user, entry['tc_obj'], entry['module'],
+                              entry['ordinal'], desc_suffix='逐条采纳',
+-                             extra_tags=['冒烟'] if is_smoke else None)
++                             extra_tags=['冒烟'] if is_smoke else None,
++                             source_page=_source_page_of(proto, entry, ref=ref,
++                                                         explicit_id=payload.get('source_page_id')))
+     if not result.get('ok'):
+         return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
+     return Response({
+diff --git a/apps/testcases/urls.py b/apps/testcases/urls.py
+index 6ee68ea..c72d74a 100644
+--- a/apps/testcases/urls.py
++++ b/apps/testcases/urls.py
+@@ -5,6 +5,7 @@ urlpatterns = [
+     # 测试用例相关
+     path('', views.TestCaseListCreateView.as_view(), name='testcase-list'),
+     path('import/', views.TestCaseImportView.as_view(), name='testcase-import'),
++    path('source-tags/', views.testcase_source_tags, name='testcase-source-tags'),
+     path('<int:pk>/', views.TestCaseDetailView.as_view(), name='testcase-detail'),
+     # 执行相关
+     path('<int:pk>/execute/', views.TestCaseExecuteView.as_view(), name='testcase-execute'),
+diff --git a/apps/testcases/views.py b/apps/testcases/views.py
+index 241d883..4530291 100644
+--- a/apps/testcases/views.py
++++ b/apps/testcases/views.py
+@@ -60,10 +60,12 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
+         if test_point:
+             qs = qs.filter(test_point_id=test_point)
+         
+-        # 按标签筛选（如 tags=冒烟）
++        # 按标签筛选（单值 tags=冒烟；多值逗号分隔 tags=冒烟,画布:P17 连胜入口，多标签为「且」关系，
++        # 供测试用例页「用例类别 + 来源画布 + 来源文件夹」组合筛选复用同一参数）
+         tag_filter = self.request.query_params.get('tags', None)
+         if tag_filter:
+-            qs = qs.filter(tags__contains=[tag_filter])
++            for _t in [x.strip() for x in tag_filter.split(',') if x.strip()]:
++                qs = qs.filter(tags__contains=[_t])
+         
+         return qs.distinct()
+     
+@@ -310,3 +312,30 @@ class TestCaseImportView(ProjectScopedMixin, APIView):
+             'failed': len(errors),
+             'errors': errors[:50],
+         })
++
++
++@api_view(['GET'])
++@permission_classes([permissions.IsAuthenticated])
++def testcase_source_tags(request):
++    """聚合当前范围（project/version）内用例 tags 中的来源标签。
++
++    墨刀采纳时会把来源写入 tags：画布:P{page_no} {page_name} / 文件夹:{folder}
++    （见 apps/requirement_analysis/modao_views.py _adopt_one_case）。
++    返回 {'canvases': [...], 'folders': [...]} 供测试用例页「来源画布/来源文件夹」筛选。
++    """
++    from apps.core.mixins import get_accessible_projects_for_user
++    qs = TestCase.objects.filter(project__in=get_accessible_projects_for_user(request.user))
++    project_id = request.query_params.get('project')
++    version_id = request.query_params.get('version')
++    if project_id:
++        qs = qs.filter(project_id=project_id)
++    if version_id:
++        qs = qs.filter(versions__id=version_id)
++    tags = set()
++    for tag_list in qs.exclude(tags=[]).values_list('tags', flat=True):
++        for t in (tag_list or []):
++            if isinstance(t, str):
++                tags.add(t)
++    canvases = sorted(t for t in tags if t.startswith('画布:'))
++    folders = sorted(t for t in tags if t.startswith('文件夹:'))
++    return Response({'canvases': canvases, 'folders': folders})
+diff --git a/frontend/src/views/requirement-analysis/CaseMergeView.vue b/frontend/src/views/requirement-analysis/CaseMergeView.vue
+index 18dd189..2b59205 100644
+--- a/frontend/src/views/requirement-analysis/CaseMergeView.vue
++++ b/frontend/src/views/requirement-analysis/CaseMergeView.vue
+@@ -784,6 +784,7 @@ export default {
+     async postAdoptSingle(row) {
+       const payload = this.payloadForSubmit(row)
+       const body = { is_smoke: !!row._isSmoke }
++      if (row._pageId != null) body.source_page_id = row._pageId
+       const ref = this.caseRefOf(row)
+       if (ref) body.case_ref = ref
+       if (payload) body.case = payload
+@@ -822,8 +823,11 @@ export default {
+         const refs = []
+         for (const row of this.selectedCases) {
+           const payload = this.payloadForSubmit(row)
++          // source_page_id：来源画布 id（含冒烟用例——其 _ref 被故意置空防误命中，
++          // 后端采纳时用它把「画布:P{n} {name} / 文件夹:{folder}」写入用例 tags 供溯源筛选）
++          const srcPageId = row._pageId != null ? row._pageId : undefined
+           if (payload) {
+-            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined })
++            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined, source_page_id: srcPageId })
+           } else {
+             refs.push(this.caseRefOf(row))
+           }
+diff --git a/frontend/src/views/testcases/TestCaseList.vue b/frontend/src/views/testcases/TestCaseList.vue
+index 6181b0f..c239720 100644
+--- a/frontend/src/views/testcases/TestCaseList.vue
++++ b/frontend/src/views/testcases/TestCaseList.vue
+@@ -114,19 +114,35 @@
+             </el-select>
+           </div>
+           <div class="filter-item filter-item--module">
+-            <el-select v-model="featureModuleFilter" placeholder="功能模块" clearable :disabled="!projectFilter" @change="handleFeatureModuleChange" size="default" class="module-select">
++            <el-select v-model="featureModuleFilter" placeholder="功能模块" clearable filterable :disabled="!projectFilter" @change="handleFeatureModuleChange" size="default" class="module-select">
++              <el-option-group v-if="featureModuleGroups.used && featureModuleGroups.used.length" label="✅ 本版本用例在用">
++                <el-option v-for="fm in featureModuleGroups.used" :key="'used-' + fm.id" :label="fm.name" :value="fm.id" />
++              </el-option-group>
+               <el-option-group v-if="featureModuleGroups.version.length" :label="`已关联 ${selectedVersionName}`">
+                 <el-option v-for="fm in featureModuleGroups.version" :key="fm.id" :label="fm.name" :value="fm.id" />
+               </el-option-group>
+               <el-option-group v-if="featureModuleGroups.unassociated.length" label="未关联版本">
+                 <el-option v-for="fm in featureModuleGroups.unassociated" :key="fm.id" :label="fm.name" :value="fm.id" />
+               </el-option-group>
++              <el-option-group v-if="featureModuleGroups.other && featureModuleGroups.other.length" label="关联了其他版本">
++                <el-option v-for="fm in featureModuleGroups.other" :key="'other-' + fm.id" :label="fm.name" :value="fm.id" />
++              </el-option-group>
+               <el-option v-for="fm in featureModuleGroups.all" :key="fm.id" :label="fm.name" :value="fm.id" />
+             </el-select>
+             <el-button size="small" circle @click="openQuickCreateFeatureModule" title="快速新建功能模块" class="quick-add-btn">
+               <el-icon><Plus /></el-icon>
+             </el-button>
+           </div>
++          <div class="filter-item">
++            <el-select v-model="sourceCanvasFilter" placeholder="来源画布" clearable filterable :disabled="!projectFilter" @change="handleFilter" size="default">
++              <el-option v-for="c in sourceTagOptions.canvases" :key="c" :label="c.replace('画布:', '')" :value="c" />
++            </el-select>
++          </div>
++          <div class="filter-item">
++            <el-select v-model="sourceFolderFilter" placeholder="来源文件夹" clearable filterable :disabled="!projectFilter" @change="handleFilter" size="default">
++              <el-option v-for="f in sourceTagOptions.folders" :key="f" :label="f.replace('文件夹:', '')" :value="f" />
++            </el-select>
++          </div>
+         </div>
+         <!-- Row 2: 测试点（功能模块下级） + 操作区 -->
+         <div class="filter-row filter-row--sub">
+@@ -475,6 +491,12 @@ const tagsFilter = ref(route.query.tags || '')
+ const versionFilter = ref(parseNum(route.query.version))
+ const featureModuleFilter = ref(parseNum(route.query.feature_module))
+ const testPointFilter = ref(parseNum(route.query.test_point))
++// 来源筛选（墨刀采纳时把来源写入用例 tags：画布:P{n} {name} / 文件夹:{folder}）
++const sourceCanvasFilter = ref(route.query.source_canvas || '')
++const sourceFolderFilter = ref(route.query.source_folder || '')
++const sourceTagOptions = ref({ canvases: [], folders: [] })
++// 本版本用例实际在用的功能模块（优先展示；修复按版本分组时「已用模块因归属其他版本而消失」的问题）
++const usedModules = ref([])
+ const allVersions = ref([])
+ const allFeatureModules = ref([])
+ const allTestPoints = ref([])
+@@ -631,7 +653,7 @@ const fetchTestCases = async () => {
+       project: projectFilter.value,
+       priority: priorityFilter.value,
+       status: statusFilter.value,
+-      tags: tagsFilter.value,
++      tags: combinedTags.value,
+       version: versionFilter.value,
+       feature_module: featureModuleFilter.value,
+       test_point: testPointFilter.value
+@@ -666,6 +688,9 @@ const handleProjectFilterChange = () => {
+   versionFilter.value = ''
+   featureModuleFilter.value = ''
+   testPointFilter.value = ''
++  sourceCanvasFilter.value = ''
++  sourceFolderFilter.value = ''
++  usedModules.value = []
+   allTestPoints.value = []
+   selectAllMode.value = false
+   currentPage.value = 1
+@@ -673,6 +698,7 @@ const handleProjectFilterChange = () => {
+   fetchTestCases()
+   // 切换项目后刷新功能模块下拉（按新项目过滤）
+   fetchFeatureModules(projectFilter.value)
++  fetchSourceTags()
+ }
+ 
+ const handleFeatureModuleChange = () => {
+@@ -692,11 +718,48 @@ const handleFeatureModuleChange = () => {
+ const handleVersionFilterChange = () => {
+   featureModuleFilter.value = ''
+   testPointFilter.value = ''
++  sourceCanvasFilter.value = ''
++  sourceFolderFilter.value = ''
+   allTestPoints.value = []
+   selectAllMode.value = false
+   currentPage.value = 1
+   syncFiltersToUrl()
+   fetchTestCases()
++  fetchUsedModules()
++  fetchSourceTags()
++}
++
++// 拉取「本版本用例实际在用」的功能模块（置顶多分组）
++const fetchUsedModules = async () => {
++  if (!versionFilter.value) {
++    usedModules.value = []
++    return
++  }
++  try {
++    const params = { used_with_version: versionFilter.value }
++    if (projectFilter.value) params.project = projectFilter.value
++    const response = await api.get('/feature-modules/', { params })
++    usedModules.value = response.data.results || response.data || []
++  } catch (error) {
++    console.error('获取本版本在用模块失败:', error)
++    usedModules.value = []
++  }
++}
++
++// 拉取来源画布/来源文件夹筛选项（后端聚合当前项目+版本下用例 tags 中的来源标签）
++const fetchSourceTags = async () => {
++  if (!projectFilter.value) {
++    sourceTagOptions.value = { canvases: [], folders: [] }
++    return
++  }
++  try {
++    const params = { project: projectFilter.value }
++    if (versionFilter.value) params.version = versionFilter.value
++    const response = await api.get('/testcases/source-tags/', { params })
++    sourceTagOptions.value = response.data || { canvases: [], folders: [] }
++  } catch (error) {
++    console.error('获取来源筛选项失败:', error)
++  }
+ }
+ 
+ // 根据选中项目过滤的版本列表
+@@ -720,7 +783,9 @@ const selectedVersionName = computed(() => {
+   return v ? v.name : ''
+ })
+ 
+-// 功能模块下拉分组：属于选中版本的归「已关联」，未填写版本的归「未关联版本」
++// 功能模块下拉分组：属于选中版本的归「已关联」，未填写版本的归「未关联版本」，
++// 关联了其他版本的归「其他」（此前会被整个丢弃，导致用户筛不到想看的模块）。
++// 「本版本用例在用」来自 usedModules（该版本下用例实际关联的模块），置顶展示。
+ const featureModuleGroups = computed(() => {
+   // 选了版本 → 按版本关联分组
+   if (versionFilter.value) {
+@@ -729,35 +794,48 @@ const featureModuleGroups = computed(() => {
+     const projectIds = (version && version.projects) ? version.projects.map(p => p.id) : []
+     const versionMods = []
+     const unassociated = []
++    const other = []
+     for (const fm of allFeatureModules.value) {
+       const pid = fm.project ? fm.project.id : fm.project_id
+       if (projectIds.length && !projectIds.includes(pid)) continue
+       const versions = fm.versions || []
+       if (versions.some(v => v.id === vid)) versionMods.push(fm)
+       else if (versions.length === 0) unassociated.push(fm)
++      else other.push(fm)
+     }
+-    return { version: versionMods, unassociated, all: [] }
++    return { used: usedModules.value, version: versionMods, unassociated, other, all: [] }
+   }
+   // 只选了项目 → 该项目下所有模块（扁平）
+   if (projectFilter.value) {
+     const pid = Number(projectFilter.value)
+     return {
++      used: [],
+       version: [],
+       unassociated: [],
++      other: [],
+       all: allFeatureModules.value.filter(fm => {
+         const fpid = fm.project ? fm.project.id : fm.project_id
+         return fpid === pid
+       })
+     }
+   }
+-  return { version: [], unassociated: [], all: [] }
++  return { used: [], version: [], unassociated: [], other: [], all: [] }
++})
++
++// 用例类别 + 来源画布 + 来源文件夹 合并为逗号分隔的 tags 参数（后端按「且」过滤）
++const combinedTags = computed(() => {
++  const arr = []
++  if (tagsFilter.value) arr.push(tagsFilter.value)
++  if (sourceCanvasFilter.value) arr.push(sourceCanvasFilter.value)
++  if (sourceFolderFilter.value) arr.push(sourceFolderFilter.value)
++  return arr.join(',')
+ })
+ 
+ // 是否有激活的筛选器
+ const hasActiveFilters = computed(() => {
+   return searchText.value || projectFilter.value || priorityFilter.value ||
+     statusFilter.value || tagsFilter.value || versionFilter.value || featureModuleFilter.value ||
+-    testPointFilter.value
++    testPointFilter.value || sourceCanvasFilter.value || sourceFolderFilter.value
+ })
+ 
+ // 重置所有筛选器
+@@ -770,6 +848,9 @@ const resetAllFilters = () => {
+   versionFilter.value = ''
+   featureModuleFilter.value = ''
+   testPointFilter.value = ''
++  sourceCanvasFilter.value = ''
++  sourceFolderFilter.value = ''
++  usedModules.value = []
+   allTestPoints.value = []
+   selectAllMode.value = false
+   tableRef.value?.clearSelection()
+@@ -789,6 +870,8 @@ const syncFiltersToUrl = () => {
+   if (versionFilter.value) query.version = versionFilter.value
+   if (featureModuleFilter.value) query.feature_module = featureModuleFilter.value
+   if (testPointFilter.value) query.test_point = testPointFilter.value
++  if (sourceCanvasFilter.value) query.source_canvas = sourceCanvasFilter.value
++  if (sourceFolderFilter.value) query.source_folder = sourceFolderFilter.value
+   if (currentPage.value > 1) query.page = String(currentPage.value)
+   router.replace({ query })
+ }
+@@ -1497,6 +1580,9 @@ onMounted(async () => {
+   fetchVersions()
+   // 关键：先加载功能模块列表，等 options 就位后再恢复筛选值渲染
+   await fetchFeatureModules(projectFilter.value)
++  // 来源筛选项 + 本版本在用模块（依赖已恢复的项目/版本筛选值）
++  fetchSourceTags()
++  fetchUsedModules()
+   // 如果 URL 中恢复了功能模块筛选，加载对应的测试点列表
+   if (featureModuleFilter.value) {
+     await fetchTestPoints(featureModuleFilter.value)
+-- 
+2.55.0.windows.3
+
