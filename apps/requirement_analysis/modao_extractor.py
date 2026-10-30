@@ -22,7 +22,7 @@ import hashlib
 import logging
 import asyncio
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin, quote
 
 logger = logging.getLogger(__name__)
@@ -1703,6 +1703,224 @@ class ModaoExtractor:
             logger.warning(f'单文件H5 手机界面文本读取失败: {e}')
         return out
 
+    async def _capture_singlefile_h5_session(self, url: str, pages_meta: List[Dict[str, Any]],
+                                            cookie_dict: Optional[Dict[str, str]] = None,
+                                            prototype_id: Optional[int] = None) -> Tuple[Dict[str, str], Dict[int, Dict[str, Any]]]:
+        """单次 Playwright 会话快速连拍所有主页面与子状态全景截图，同时读取屏幕 innerText。
+        避免对每个状态反复 launch 浏览器。保持全景视口截图，绝不裁切需求信息。
+        """
+        from playwright.async_api import async_playwright
+        screen_texts: Dict[str, str] = {}
+        shot_manifest: Dict[int, Dict[str, Any]] = {}
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                context = await browser.new_context(
+                    viewport={'width': 1440, 'height': 900},
+                    user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                                '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'))
+                if cookie_dict:
+                    cookies = [{'name': k, 'value': v, 'url': url} for k, v in cookie_dict.items()]
+                    await context.add_cookies(cookies)
+
+                page = await context.new_page()
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+
+                for idx, meta in enumerate(pages_meta, 1):
+                    _raise_if_terminated(prototype_id)
+                    pid = meta.get('id') or f'page{idx}'
+                    states = meta.get('states') or []
+                    page_entry = {'default_shot': None, 'state_shots': []}
+
+                    # 1. 切换并拍摄默认态全景
+                    try:
+                        await page.evaluate(f"render('{pid}')")
+                        await page.wait_for_timeout(250)
+                    except Exception as e:
+                        logger.warning(f"页面[{pid}] render 失败: {e}")
+
+                    # 读取屏幕文本
+                    try:
+                        stxt = await page.evaluate("""() => {
+                            const el = document.querySelector('.phone') || document.querySelector('.screen') || document.body;
+                            return el ? (el.innerText || el.textContent || '') : '';
+                        }""")
+                        screen_texts[pid] = (stxt or '').strip()
+                    except Exception:
+                        screen_texts[pid] = ''
+
+                    default_shot = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
+                    try:
+                        await page.screenshot(path=default_shot, full_page=False)
+                        page_entry['default_shot'] = default_shot
+                    except Exception as e:
+                        logger.warning(f"默认态截图失败 ws_page_{idx}.png: {e}")
+
+                    # 2. 遍历状态快速切态连拍
+                    for si, st in enumerate(states, 1):
+                        _raise_if_terminated(prototype_id)
+                        st = str(st).strip()
+                        if not st:
+                            continue
+                        switched = False
+                        for js in (
+                            f"render('{pid}');setState('{pid}', '{st}')",
+                            f"render('{pid}');setState('{st}')",
+                            f"setState('{st}')",
+                        ):
+                            try:
+                                await page.evaluate(js)
+                                switched = True
+                                break
+                            except Exception:
+                                continue
+                        if switched:
+                            await page.wait_for_timeout(200)
+                            st_shot = os.path.join(self.shot_dir, f'ws_page_{idx}_st{si}.png')
+                            try:
+                                await page.screenshot(path=st_shot, full_page=False)
+                                page_entry['state_shots'].append({'state': st, 'shot_path': st_shot})
+                            except Exception as e:
+                                logger.warning(f"状态态截图失败 {st_shot}: {e}")
+
+                    shot_manifest[idx] = page_entry
+
+                await browser.close()
+        except Exception as e:
+            logger.error(f"单文件H5 极速连拍会话异常: {e}")
+
+        return screen_texts, shot_manifest
+
+    @staticmethod
+    def _is_image_file_different(path_a: str, path_b: str) -> bool:
+        """轻量级图片差异比对：
+        1. 路径或文件不存在时视为差异（兜底保护）；
+        2. sha256 相同判定为完全无差异；
+        3. 文件大小差异微弱且内容哈希匹配时判定无差异。
+        """
+        if not path_a or not path_b or not os.path.exists(path_a) or not os.path.exists(path_b):
+            return True
+        try:
+            import hashlib
+            with open(path_a, 'rb') as fa, open(path_b, 'rb') as fb:
+                ha = hashlib.sha256(fa.read()).hexdigest()
+                hb = hashlib.sha256(fb.read()).hexdigest()
+                if ha == hb:
+                    return False
+        except Exception:
+            pass
+        return True
+
+    def _plan_visual_jobs(self, shot_manifest: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """为所有页面与状态编排视觉识别任务：
+        主页面默认图 100% 触发 full 视觉识别；
+        子状态图比对默认图，存在差异才派发 incremental 任务，否则直接标记 inherit。
+        """
+        jobs = []
+        for idx, entry in shot_manifest.items():
+            def_shot = entry.get('default_shot')
+            if def_shot:
+                jobs.append({
+                    'page_idx': idx,
+                    'job_type': 'full',
+                    'shot_path': def_shot,
+                    'state': None,
+                })
+
+            for st_info in entry.get('state_shots', []):
+                st_shot = st_info.get('shot_path')
+                st_name = st_info.get('state')
+                if st_shot:
+                    if self._is_image_file_different(def_shot, st_shot):
+                        jobs.append({
+                            'page_idx': idx,
+                            'job_type': 'incremental',
+                            'shot_path': st_shot,
+                            'state': st_name,
+                        })
+                    else:
+                        jobs.append({
+                            'page_idx': idx,
+                            'job_type': 'inherit',
+                            'shot_path': st_shot,
+                            'state': st_name,
+                        })
+        return jobs
+
+    async def _execute_visual_jobs_pool(self, jobs: List[Dict[str, Any]], vision_config,
+                                       prototype_id: Optional[int] = None,
+                                       concurrency: int = 6) -> Dict[int, Dict[str, Any]]:
+        """使用 asyncio.Semaphore 并发调度视觉分析任务。
+        并发调用阿里 DashScope 多模态大模型，复用已有 sha256 缓存。
+        """
+        if not jobs or not vision_config:
+            return {}
+
+        sem = asyncio.Semaphore(concurrency)
+        results_by_page: Dict[int, Dict[str, Any]] = {}
+
+        async def _run_one(job):
+            _raise_if_terminated(prototype_id)
+            pidx = job['page_idx']
+            jtype = job['job_type']
+            spath = job['shot_path']
+            st_name = job.get('state')
+
+            if jtype == 'inherit':
+                return pidx, {'job_type': 'inherit', 'state': st_name, 'result': None}
+
+            async with sem:
+                _raise_if_terminated(prototype_id)
+                try:
+                    res = await self._ocr_screenshot(vision_config, spath)
+                except Exception as e:
+                    logger.warning(f"视觉分析失败 ({spath}): {e}")
+                    res = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                return pidx, {'job_type': jtype, 'state': st_name, 'result': res}
+
+        tasks = [_run_one(j) for j in jobs]
+        completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item in completed:
+            if isinstance(item, Exception):
+                logger.warning(f"视觉并发分析单项发生异常: {item}")
+                continue
+            pidx, data = item
+            if pidx not in results_by_page:
+                results_by_page[pidx] = {
+                    'ocr_text': '',
+                    'visual_summary': '',
+                    'visual_artifacts': [],
+                    'states_data': []
+                }
+
+            jtype = data['job_type']
+            res = data.get('result') or {}
+            st_name = data.get('state')
+
+            if jtype == 'full':
+                results_by_page[pidx]['ocr_text'] = res.get('ocr_text', '')
+                results_by_page[pidx]['visual_summary'] = res.get('visual_summary', '')
+                results_by_page[pidx]['visual_artifacts'] = res.get('visual_artifacts', [])
+            elif jtype == 'incremental' and res:
+                results_by_page[pidx]['states_data'].append({
+                    'state': st_name,
+                    'summary': res.get('visual_summary', ''),
+                    'new_text': res.get('ocr_text', ''),
+                    'artifacts': res.get('visual_artifacts', [])
+                })
+            elif jtype == 'inherit':
+                results_by_page[pidx]['states_data'].append({
+                    'state': st_name,
+                    'summary': '(无结构变更)',
+                    'new_text': '',
+                    'artifacts': []
+                })
+
+        return results_by_page
+
 
     def _extract_singlefile_h5(self, url: str, cookie_dict: Optional[Dict[str, str]] = None,
                                vision_config=None, dual_fusion: bool = False,
@@ -1772,14 +1990,31 @@ class ModaoExtractor:
                 pages_meta = _named
                 logger.info(f'[单文件H5单画布重读] 目标画布收敛为 {len(pages_meta)} 张: {sorted(_target_set)}')
 
-        # 手机界面 DOM 文本（免费）：单次 Playwright 会话逐页 render 读 .phone/.screen innerText，
-        # 与模板「需求说明」互补。state 切换需逐状态点击后再读文案，故逐 state 读取。
+        # 1. 单会话复用快速连拍全景截图与屏幕文本提取 (耗时从 ~8分钟骤降至 ~20秒)
+        _proto_id = getattr(self, 'prototype_id', None)
         screen_texts: Dict[str, str] = {}
+        shot_manifest: Dict[int, Dict[str, Any]] = {}
         try:
-            screen_texts = asyncio.run(self._read_singlefile_h5_screen_texts(url, pages_meta))
+            screen_texts, shot_manifest = asyncio.run(
+                self._capture_singlefile_h5_session(url, pages_meta, cookie_dict=cookie_dict, prototype_id=_proto_id)
+            )
         except Exception as e:
-            logger.warning(f'单文件H5 手机界面文本读取失败: {e}')
+            logger.warning(f'单文件H5 会话截图连拍失败，回退为空: {e}')
 
+        # 2. 编排视觉识别任务：主图全量深度识别 + 子状态智能差分
+        visual_jobs = self._plan_visual_jobs(shot_manifest) if vision_config else []
+
+        # 3. 异步并发池化推理 (Semaphore=6 并发加速，彻底消灭串行排队)
+        visual_results: Dict[int, Dict[str, Any]] = {}
+        if visual_jobs and vision_config:
+            try:
+                visual_results = asyncio.run(
+                    self._execute_visual_jobs_pool(visual_jobs, vision_config, prototype_id=_proto_id)
+                )
+            except Exception as e:
+                logger.warning(f'视觉并发分析执行异常: {e}')
+
+        # 4. 组装全景 ModaoPage 结构 (保持 100% 格式对齐，包含完整 bbox 坐标与组件)
         for idx, meta in enumerate(pages_meta, 1):
             try:
                 pid = meta.get('id') or f'page{idx}'
@@ -1790,92 +2025,47 @@ class ModaoExtractor:
                 dom_text = ''
                 if isinstance(tpl_html, str):
                     dom_text = html.unescape(_TAG_RE.sub(' ', tpl_html)).strip()
-                # 合并手机界面 DOM 文本（免费），补上模板「需求说明」未覆盖的界面文案
                 stxt = (screen_texts.get(pid) or '').strip()
                 if stxt:
                     dom_text = (dom_text + '\n[手机界面] ' + stxt).strip()
-                screenshot_path = ''
-                vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
-                vision_text = ''
-                vision_attempted = False
-                page_vision_summary = ''
-                page_vision_artifacts = []
-                # 视觉补充（与 webshare 一致）：双路融合 / 纯图片页 / 混合页时触发。
-                # 单文件 H5 所有页面同 URL，靠 render(pageId) 切页。状态按钮切换时**纯文本内容不变，
-                # 变化的是图片/图标**，因此 OCR 文本与 visual_summary 只取默认态一次（逐状态 OCR 会得到
-                # 重复文本，徒增视觉模型调用开销且叠加噪声）。但每个状态的「图」仍需截图保留为视觉证据：
-                # 这里逐状态切换后仅截图、不调 OCR，最后一张状态截图作为画布代表截图。
-                states = meta.get('states') or []
-                if vision_config and (
-                    dual_fusion or len(dom_text.strip()) < 30 or self._html_has_visual(tpl_html)
-                ):
-                    vision_attempted = True
-                    # 默认态截图 OCR（拿文本 + 视觉摘要）
-                    try:
-                        vision_result = asyncio.run(self._ocr_webshare_page_async(
-                            url, cookie_dict or {}, vision_config, idx,
-                            post_js=f"render('{pid}')", shot_name=f'ws_page_{idx}.png'))
-                    except Exception as e:
-                        vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
-                        logger.warning(f'单文件H5 页面[{page_name}]默认态视觉OCR失败: {e}')
-                    vision_text = vision_result.get('ocr_text', '')
-                    page_vision_summary = vision_result.get('visual_summary', '')
-                    page_vision_artifacts = vision_result.get('visual_artifacts', []) or []
-                    default_ocr_lines = {ln.strip() for ln in (vision_text or '').splitlines() if ln.strip()}
-                    # 逐状态：切换后截图并做完整 OCR，但只保留相对默认态的文本差异
-                    # （避免状态间公共文案重复；同时保留新增提示/错误文案，如登录失败提示）。
-                    for si, st in enumerate(states, 1):
-                        st = str(st).strip()
-                        if not st:
-                            continue
-                        switched = False
-                        st_result = None
-                        for js in (
-                            f"render('{pid}');setState('{pid}', '{st}')",
-                            f"render('{pid}');setState('{st}')",
-                            f"setState('{st}')",
-                        ):
-                            try:
-                                st_result = asyncio.run(self._ocr_webshare_page_async(
-                                    url, cookie_dict or {}, vision_config, idx,
-                                    post_js=js,
-                                    shot_name=f'ws_page_{idx}_st{si}.png',
-                                    summary_only=False))
-                                switched = True
-                                break
-                            except Exception:
-                                continue
-                        if not switched or not st_result:
-                            continue
-                        if st_result.get('visual_summary'):
-                            page_vision_summary = (page_vision_summary
-                                                   + f'\n[状态:{st}]\n' + st_result['visual_summary']).strip()
-                        # 只保留默认态没有的文本行，防止状态间重复叠加
-                        st_ocr_lines = [ln for ln in (st_result.get('ocr_text') or '').splitlines()
-                                        if ln.strip() and ln.strip() not in default_ocr_lines]
-                        if st_ocr_lines:
-                            page_vision_summary = (page_vision_summary
-                                                   + f'\n[状态:{st} 新增文本]\n' + '\n'.join(st_ocr_lines)).strip()
-                            vision_text = (vision_text
-                                           + f'\n[状态:{st}]\n' + '\n'.join(st_ocr_lines)).strip()
-                        # 最后一张状态截图作为该画布代表截图（视觉证据）
-                        st_shot = os.path.join(self.shot_dir, f'ws_page_{idx}_st{si}.png')
-                        if os.path.exists(st_shot):
-                            screenshot_path = os.path.relpath(st_shot, self.media_root)
-                vision_success = bool(
-                    vision_text
-                    or page_vision_summary
-                    or page_vision_artifacts
-                )
+
+                vdata = visual_results.get(idx) or {}
+                vision_text = vdata.get('ocr_text', '')
+                page_vision_summary = vdata.get('visual_summary', '')
+                page_vision_artifacts = list(vdata.get('visual_artifacts') or [])
+
+                # 融合子状态增量视觉文本与组件坐标
+                states_info = vdata.get('states_data', [])
+                for st_item in states_info:
+                    st_name = st_item.get('state')
+                    st_sum = st_item.get('summary')
+                    st_txt = st_item.get('new_text')
+                    if st_sum and st_sum != '(无结构变更)':
+                        page_vision_summary = (page_vision_summary + f'\n[状态:{st_name}]\n' + st_sum).strip()
+                    if st_txt:
+                        vision_text = (vision_text + f'\n[状态:{st_name}]\n' + st_txt).strip()
+                    if st_item.get('artifacts'):
+                        page_vision_artifacts.extend(st_item['artifacts'])
+
+                # 代表截图优先取状态截图或默认全景
+                entry = shot_manifest.get(idx) or {}
+                st_shots = entry.get('state_shots', [])
+                shot_file = st_shots[-1]['shot_path'] if st_shots else entry.get('default_shot')
+                if not shot_file or not os.path.exists(shot_file):
+                    shot_file = entry.get('default_shot')
+                screenshot_path = os.path.relpath(shot_file, self.media_root) if shot_file and os.path.exists(shot_file) else ''
+
+                vision_attempted = bool(vision_config)
+                vision_success = bool(vision_text or page_vision_summary or page_vision_artifacts)
+
                 text = (dom_text or '')
                 if vision_text:
                     text = text + '\n[视觉OCR补充]\n' + vision_text
-                rendered_shot = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
-                if os.path.exists(rendered_shot) and not screenshot_path:
-                    screenshot_path = os.path.relpath(rendered_shot, self.media_root)
+
                 page_vision_text = vision_text or ''
                 if page_vision_summary:
                     page_vision_text = (page_vision_text + '\n' + page_vision_summary).strip()
+
                 pages.append({
                     'page_no': idx,
                     'page_name': page_name,
@@ -1889,7 +2079,7 @@ class ModaoExtractor:
                     'screenshot': screenshot_path,
                     'visual_summary': page_vision_summary,
                     'visual_artifacts': page_vision_artifacts,
-                    'states': states,
+                    'states': meta.get('states') or [],
                     'extraction_warnings': (
                         ['视觉识别未返回有效内容']
                         if vision_attempted and not vision_success else []

@@ -29,6 +29,12 @@ class FeatureModuleListCreateView(ProjectScopedMixin, generics.ListCreateAPIView
         version_id = self.request.query_params.get('version_id')
         if version_id:
             qs = qs.filter(versions__id=version_id)
+        # used_with_version=<vid>：返回该版本下至少被一条用例实际关联的模块。
+        # 供测试用例页的功能模块下拉优先展示「真实在用」的模块（修复按版本分组时
+        # 部分已用模块因归属其他版本而整个消失、用户筛不到的问题）。
+        used_with_version = self.request.query_params.get('used_with_version')
+        if used_with_version:
+            qs = qs.filter(testcases__versions__id=used_with_version)
         return qs.distinct()
 
     def perform_create(self, serializer):

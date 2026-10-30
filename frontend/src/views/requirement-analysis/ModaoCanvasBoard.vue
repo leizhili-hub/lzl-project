@@ -167,12 +167,12 @@
     </el-tabs>
 
     <!-- ============ 单画布详情抽屉 ============ -->
-    <el-drawer :title="focused && ((focused.parent_name ? (focused.parent_name + ' / ') : '') + (focused.page_name || ('P' + focused.page_no))) + ' · 单画布流水线'"
+    <el-drawer :title="focused && ((focused.parent_name ? (focused.parent_name + ' / ') : '') + 'P' + focused.page_no + ' ' + (focused.page_name || '未命名画布')) + ' · 单画布流水线'"
       v-model="drawerVisible" size="62%" direction="rtl" @closed="focused = null">
       <div v-if="focused" class="canvas-detail">
         <el-alert type="info" :closable="false" show-icon
           :title="`当前阶段：${stageMeta(focused.current_stage, focused.stage_status).label}`"
-          :description="`单画布模式：每点击一次下方按钮只会对「${focused.page_name || ('P' + focused.page_no)}」这一个画布生效，不影响其他画布。`" />
+          :description="`单画布模式：每点击一次下方按钮只会对「P${focused.page_no} ${focused.page_name || '未命名画布'}」这一个画布生效，不影响其他画布（原型允许同名画布，以 P 页码区分）。`" />
 
         <div class="detail-actions">
           <el-button size="small" :loading="busy" @click="runCanvasStage('struct', focused)">🔧 结构化</el-button>

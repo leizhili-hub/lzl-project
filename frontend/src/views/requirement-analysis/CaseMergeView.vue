@@ -110,8 +110,44 @@
 
     <!-- 冒烟用例 -->
     <div v-if="filteredSmoke.length" class="smoke-section">
-      <h4>冒烟用例 ({{ filteredSmoke.length }})</h4>
-      <el-table ref="smokeTable" :data="displaySmoke" size="small" border stripe max-height="400">
+      <div class="smoke-header">
+        <div class="smoke-header-left">
+          <h4>🔥 冒烟用例 ({{ filteredSmoke.length }})</h4>
+          <span class="smoke-header-tip">
+            共 {{ filteredSmoke.length }} 条 / 待采纳 {{ displaySmoke.length }} 条
+            <template v-if="selectedSmoke.length">/ 已选 {{ selectedSmoke.length }} 条</template>
+          </span>
+        </div>
+        <div class="smoke-header-actions">
+          <el-dropdown
+            split-button
+            type="primary"
+            size="small"
+            :loading="exportingSmoke"
+            @click="exportZentaoSmoke('csv', 'utf-8')"
+            @command="handleExportCommand"
+          >
+            📥 导出禅道 CSV (UTF-8)
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="csv-utf8">📥 导出禅道 CSV (UTF-8 编码) - 推荐</el-dropdown-item>
+                <el-dropdown-item command="csv-gbk">📥 导出禅道 CSV (GBK 编码) - 适配GBK禅道</el-dropdown-item>
+                <el-dropdown-item command="xlsx">📥 导出禅道 Excel (.xlsx)</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+      </div>
+      <el-table
+        ref="smokeTable"
+        :data="displaySmoke"
+        size="small"
+        border
+        stripe
+        max-height="400"
+        @selection-change="onSmokeSelectionChange"
+      >
+        <el-table-column type="selection" width="50" />
         <el-table-column type="index" width="50" />
         <el-table-column label="关联项目" width="110" show-overflow-tooltip>
           <template #default="{ row }">{{ proto.project_name || '-' }}</template>
@@ -379,6 +415,8 @@ export default {
       diffEdit: [],
       backfilling: false,
       typeOptions: TYPE_OPTIONS,
+      exportingSmoke: false,
+      selectedSmoke: [],
     }
   },
   computed: {
@@ -471,7 +509,8 @@ export default {
       return this.filteredSmoke.filter(c => !this.adoptedKeys[c._key])
     },
     adoptedCount() {
-      return Object.keys(this.adoptedKeys).length
+      // 仅统计当前普通用例中已采纳（已入库）的数量，排除冒烟用例 key
+      return this.filteredCases.filter(c => this.adoptedKeys[c._key]).length
     },
     currentKey() {
       return this.current ? this.current._key : ''
@@ -784,6 +823,7 @@ export default {
     async postAdoptSingle(row) {
       const payload = this.payloadForSubmit(row)
       const body = { is_smoke: !!row._isSmoke }
+      if (row._pageId != null) body.source_page_id = row._pageId
       const ref = this.caseRefOf(row)
       if (ref) body.case_ref = ref
       if (payload) body.case = payload
@@ -822,8 +862,11 @@ export default {
         const refs = []
         for (const row of this.selectedCases) {
           const payload = this.payloadForSubmit(row)
+          // source_page_id：来源画布 id（含冒烟用例——其 _ref 被故意置空防误命中，
+          // 后端采纳时用它把「画布:P{n} {name} / 文件夹:{folder}」写入用例 tags 供溯源筛选）
+          const srcPageId = row._pageId != null ? row._pageId : undefined
           if (payload) {
-            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined })
+            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined, source_page_id: srcPageId })
           } else {
             refs.push(this.caseRefOf(row))
           }
@@ -945,6 +988,77 @@ export default {
         this.backfilling = false
       }
     },
+    onSmokeSelectionChange(selection) {
+      this.selectedSmoke = selection || []
+    },
+    handleExportCommand(cmd) {
+      if (cmd === 'csv-utf8') this.exportZentaoSmoke('csv', 'utf-8')
+      else if (cmd === 'csv-gbk') this.exportZentaoSmoke('csv', 'gbk')
+      else if (cmd === 'xlsx') this.exportZentaoSmoke('xlsx', 'utf-8')
+    },
+    async exportZentaoSmoke(format = 'csv', encode = 'utf-8') {
+      const targetList = this.selectedSmoke.length > 0 ? this.selectedSmoke : this.filteredSmoke
+      if (!targetList || targetList.length === 0) {
+        this.$message.warning('当前没有可导出的冒烟用例')
+        return
+      }
+
+      this.exportingSmoke = true
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/export-smoke-zentao/`,
+          method: 'post',
+          data: {
+            cases: targetList,
+            format: format,
+            encode: encode,
+          },
+          responseType: 'blob'
+        })
+
+        const blob = res.data
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        const rawTitle = (this.proto && this.proto.title) || (`任务#${this.protoId}`)
+        const safeTitle = rawTitle.replace(/[\\/:*?"<>|]/g, '_')
+        const ext = format === 'xlsx' ? 'xlsx' : 'csv'
+        const encLabel = format === 'xlsx' ? '' : (encode === 'gbk' ? '_GBK' : '_UTF8')
+        const fileName = `${safeTitle}_冒烟用例_禅道${encLabel}.${ext}`
+
+        a.href = url
+        a.download = fileName
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        window.URL.revokeObjectURL(url)
+
+        if (format === 'csv') {
+          const encUpper = encode.toUpperCase()
+          this.$alert(
+            `<div style="line-height: 1.8; font-size: 14px;">
+              已成功下载文件：<b style="color: #409EFF;">${fileName}</b><br><br>
+              <div style="background: #fdf6ec; border: 1px solid #faecd8; padding: 10px 14px; border-radius: 6px; color: #e6a23c; margin-bottom: 12px;">
+                ⚠️ <b>导入无数据排查说明：</b><br>
+                禅道「导入CSV」页面的【编码】下拉选项，<b>必须与当前文件编码完全一致</b>（否则禅道解析不到数据会提示无数据）！
+              </div>
+              <b>📌 禅道导入操作步骤：</b><br>
+              1. 打开禅道系统：进入 <b>「测试」-&gt;「用例」-&gt; 点击右上角「...」或「导入」-&gt;「导入CSV」</b>；<br>
+              2. <b>【关键】</b>在导入页面的<b>【编码】</b>下拉框中，请选择 <b>「${encUpper}」</b>；<br>
+              3. 点击【选择文件】上传 <code>${fileName}</code>，点击保存即可顺利入库！
+            </div>`,
+            '禅道 CSV 导入操作指引',
+            { dangerouslyUseHTMLString: true, type: 'success', confirmButtonText: '我知道了' }
+          )
+        } else {
+          this.$message.success(`已成功导出 ${targetList.length} 条冒烟用例（Excel 格式）`)
+        }
+      } catch (err) {
+        console.error('导出禅道用例失败:', err)
+        this.$message.error('导出失败: ' + (err.response?.data?.detail || err.message || err))
+      } finally {
+        this.exportingSmoke = false
+      }
+    },
     goBack() {
       this.$router.push(`/ai-generation/modao-board/${this.protoId}`)
     },
@@ -996,7 +1110,24 @@ export default {
 
   .smoke-section {
     margin-top: 24px;
-    h4 { margin: 0 0 12px; color: #303133; }
+    .smoke-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      .smoke-header-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        h4 { margin: 0; color: #303133; }
+        .smoke-header-tip { color: #909399; font-size: 13px; }
+      }
+      .smoke-header-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+    }
   }
 
   .detail-source {
