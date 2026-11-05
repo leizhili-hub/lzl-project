@@ -22,7 +22,7 @@ import hashlib
 import logging
 import asyncio
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin, quote
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,14 @@ def _raise_if_terminated(prototype_id):
 
 # 页面树常见选择器（按优先级尝试；命中其一即认为找到页面列表）。
 # 既兼容墨刀，也尽量覆盖 webshare / 通用原型 SPA 的左侧页面树（best-effort）。
+# 页面项无 data-cid 时（如单文件 HTML 报告页），视口指纹是唯一判据。
+# 取 64x64 灰度下"灰度差 > 8 的像素占比"作为差异比例。
+# 阈值 0.05 由 proto=93 实测定标（1440x900 截图）：
+#   仅左侧导航选中态变化（= 画布其实没切换）= 0.003 ~ 0.005
+#   真实画布内容切换                        = 0.14 ~ 0.42
+# 两者分界极清晰，取 0.05 既不会误杀真实切换，也能识别"只高亮了导航但画布没动"。
+_MIN_VIEWPORT_DIFF_RATIO = 0.05
+
 PAGE_TREE_SELECTORS = [
     # 墨刀当前分享视图：真正可点击的页面行带 data-cid；不要命中其内部
     # `.screen-item-icon`，否则 click() 只会选中图标而不会切换画布。
@@ -465,7 +473,8 @@ class ModaoExtractor:
                         print(f'[EXTRACT_LOOP] page {idx} activating...', flush=True)
                         switched = await asyncio.wait_for(
                             self._activate_page_item(
-                                page, item, other_items=_others, item_cid=_item_cid),
+                                page, item, other_items=_others, item_cid=_item_cid,
+                                on_note=extraction_warnings.append),
                             timeout=120)
                         if not switched:
                             # 点击后画布未变化：可能是纯分组/容器节点，也可能是墨刀渲染延迟
@@ -474,7 +483,9 @@ class ModaoExtractor:
                             # 这样可以避免把「内容相似的真实画布」误判为分组节点而丢失。
                             logger.warning(
                                 f'页面项"{page_name}"点击后画布未变化，仍保留并计入重复检测')
-                            extraction_warnings.append('点击后视口指纹未变化，已保留待重复检测')
+                            extraction_warnings.append(
+                                '点击后未能确认画布切换（无 data-cid 且视口差异不足），'
+                                '已保留待截图重复检测判定')
                     else:
                         # 单页模式：确保回到原型根视图
                         pass
@@ -689,6 +700,31 @@ class ModaoExtractor:
                     f'检测到 {duplicate_count} 个重复画布截图，重复页不应视为读取成功：'
                     + '；'.join(','.join(str(no) for no in group) for group in duplicate_groups)
                 )
+                # ⚠️ 2026-11-04：重复截图必须阻断，否则"点击画布未真正切换"会被静默当成成功。
+                # 实测 proto=93（单文件 HTML 报告页）：19 个画布只截出 8 张不同图，
+                # 两组分别 5 个 / 8 个画布共用同一张截图（重复率 58%），但此前只写 warning，
+                # 导致每个画布的 visual_artifacts 都混入同一份内容 → 阶段1 逐画布结构化时
+                # 搜索模块需求被注入每个画布、每个画布产出同一批无关测试点。
+                # 判据与 CODEBUDDY.md 约定一致：重复率 > 20% 即判定阶段0 失败。
+                _dup_ratio = duplicate_count / float(len(pages) or 1)
+                if _dup_ratio > 0.2:
+                    warnings.append(
+                        f'画布重复截图比例 {_dup_ratio:.0%} 超过 20% 阈值：'
+                        f'点击画布可能未真正切换（{duplicate_count}/{len(pages)} 页重复），'
+                        f'本次读取结果不可信，请检查原型页面结构或改用逐页链接'
+                    )
+                    logger.error(
+                        '[EXTRACT] 重复截图比例 %.0f%%，阶段0 判定失败（%d/%d 页重复）',
+                        _dup_ratio * 100, duplicate_count, len(pages))
+                    result_blocked = {
+                        'run_id': self.run_id, 'url': url, 'pages': pages,
+                        'warnings': warnings, 'duplicate_blocked': True,
+                        'duplicate_ratio': _dup_ratio,
+                    }
+                    if dual_fusion:
+                        result_blocked['dual_fusion'] = True
+                        result_blocked['fused_requirements'] = []
+                    return result_blocked
 
             await browser.close()
 
@@ -1680,6 +1716,11 @@ class ModaoExtractor:
                                 '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'))
                 page = await context.new_page()
                 await page.goto(url, wait_until='networkidle', timeout=60000)
+                # 左侧目录懒渲染：先等 .nav-item 出现，再交给 _read_nav_directory 做稳定性采样
+                try:
+                    await page.wait_for_selector('.nav-item', timeout=15000, state='attached')
+                except Exception:
+                    logger.info('[单文件H5] 未等到 .nav-item 出现（可能非目录式原型）')
 
                 async def _read_screen():
                     return await page.evaluate('''() => {
@@ -1702,6 +1743,509 @@ class ModaoExtractor:
         except Exception as e:
             logger.warning(f'单文件H5 手机界面文本读取失败: {e}')
         return out
+
+    _RUNTIME_PAGES_JS = '''() => {
+        // 从单文件原型的运行时变量里取权威页面清单，避免正则命中已废弃的内联数组。
+        // 已知形态：
+        //   scopeStates : { <pageId>: {...状态...} }   —— 旧版画布的页面集合
+        //   newPages    : [{id, title, group, states}] —— 新增画布的页面集合
+        //   retained    : Set<pageId>                  —— 页面真正可达的白名单
+        const out = { pages: [], retained: [], source: '' };
+        const push = (id, title, group, states) => {
+            if (!id) return;
+            out.pages.push({
+                id: String(id),
+                title: String(title || ''),
+                group: String(group || ''),
+                states: Array.isArray(states) ? states.map(String) : [],
+            });
+        };
+        try { out.retained = Array.from(retained); } catch (e) {}
+        try {
+            for (const id of Object.keys(scopeStates)) {
+                let st = [];
+                try {
+                    const v = scopeStates[id];
+                    if (Array.isArray(v)) st = v;
+                    else if (v && typeof v === 'object') st = Object.keys(v);
+                } catch (e) {}
+                push(id, id, '', st);
+            }
+            if (out.pages.length) out.source = 'scopeStates';
+        } catch (e) {}
+        try {
+            if (typeof newPages !== 'undefined' && Array.isArray(newPages)) {
+                for (const p of newPages) {
+                    if (!p || !p.id) continue;
+                    // 去掉与 scopeStates 重复的 id
+                    if (out.pages.some(x => x.id === p.id)) continue;
+                    push(p.id, p.title, p.group, p.states);
+                }
+                out.source += (out.source ? '+' : '') + 'newPages';
+            }
+        } catch (e) {}
+        return out;
+    }'''
+
+    _NAV_DIRECTORY_JS = '''() => {
+        // 从左侧目录（.nav-group 分组标题 + .nav-item 可点击条目）读取权威页面清单。
+        // 单文件报告页的 .nav-item 形如：
+        //   <button class="nav-item" onclick="vDirectory('search')">搜索</button>
+        // onclick 里的参数就是页面真实 id（与 render()/retained 一致），
+        // 而显示文本是作者定义的模块名 —— 这就是需求的真实目录结构。
+        const groups = [];
+        const nodes = Array.from(document.querySelectorAll('.nav-group, .nav-item'));
+        let cur = '';
+        for (const el of nodes) {
+            if (el.classList && el.classList.contains('nav-group')) {
+                cur = (el.innerText || '').trim();
+                continue;
+            }
+            const oc = el.getAttribute('onclick') || '';
+            const m = oc.match(/v(?:Directory|Go)\\(['"]([^'"]+)['"]\\)/);
+            groups.push({
+                group: cur,
+                title: (el.innerText || '').trim(),
+                id: m ? m[1] : '',
+                active: el.classList.contains('active'),
+            });
+        }
+        return groups;
+    }'''
+
+    async def _read_nav_directory(self, page) -> Optional[List[Dict[str, Any]]]:
+        """读取左侧目录（nav-group + nav-item），作为**权威页面清单**。
+
+        ⚠️ 2026-11-04 新增（hanakoi v1.10 单文件报告页实测）：
+        该格式此前用正则解析内联 ``pages`` 数组取页面 id，结果拿到 19 个 id，
+        其中 11 个（home/role/creator/chats/appearance…）是**已废弃 id**，
+        不在页面 ``retained`` 白名单内，``render(id)`` 会被回落成
+        ``create-method`` → 11 个画布截到同一张图，视觉产物大面积串页。
+
+        真正权威的是左侧目录：
+          - ``.nav-group``  = 模块分组（如「V1.10 · 聊天」「心动角色测验」）；
+          - ``.nav-item``   = 页面条目，显示名是作者定义的模块名，
+                              ``onclick="vDirectory('<真实id>')"`` 给出真实 id。
+        实测 33 个条目可切出 29 个不同画面，且与业务模块边界完全对应。
+        未被目录收录的 id（qa-*/heart-*/studio47-start 等流程中间态与废弃页）
+        一律不纳入本期 —— 这与「走最新版」的口径一致。
+
+        返回 None 表示页面没有这种目录结构（非本格式），调用方沿用原路径。
+        """
+        # ⚠️ 左侧目录是**懒渲染**的：实测 networkidle 后立即读到 28 个 .nav-item，
+        # +1s 变 29，+3s 变 31，之后稳定在 30。直接读会漏页面。
+        # 因此先等节点数量连续两次采样不变（最多约 8 秒）再取。
+        try:
+            _prev = -1
+            for _ in range(8):
+                _cnt = await page.evaluate(
+                    "() => document.querySelectorAll('.nav-group, .nav-item').length")
+                if _cnt == _prev and _cnt > 0:
+                    break
+                _prev = _cnt
+                await page.wait_for_timeout(1000)
+            logger.info('[单文件H5] 左侧目录渲染稳定，节点数=%s', _prev)
+        except Exception as e:
+            logger.info('[单文件H5] 等待左侧目录渲染稳定失败（继续读取）: %s', e)
+
+        try:
+            rows = await page.evaluate(self._NAV_DIRECTORY_JS)
+        except Exception as e:
+            logger.info('[单文件H5] 读取左侧目录异常: %s', e)
+            return None
+        if not isinstance(rows, list) or not rows:
+            return None
+        kept = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            title = str(r.get('title') or '').strip()
+            pid = str(r.get('id') or '').strip()
+            if not title:
+                continue
+            kept.append({
+                'id': pid or title,          # 无 onclick 时用显示名兜底
+                'title': title,
+                'group': str(r.get('group') or '').strip(),
+                'states': [],
+                '_nav_entry': True,
+            })
+        if not kept:
+            return None
+        logger.info('[单文件H5] 左侧目录读取成功：%d 条目 / %d 个分组',
+                    len(kept), len({k['group'] for k in kept if k['group']}))
+        return kept
+
+    async def _click_nav_entry(self, page, meta: Dict[str, Any]) -> bool:
+        """点击左侧目录中与 meta 对应的 ``.nav-item`` 条目，完成画布切换。
+
+        按 ``title``（显示名）+ ``group``（所属分组）**精确**定位，不用模糊匹配：
+        该页面存在同名不同组的条目风险极低，而模糊匹配会把「角色创建方式」误配到
+        「创建/编辑角色」。定位成功后比对 ``.phone`` 文本是否变化以确认真的切换。
+
+        失败返回 False，由调用方回退 ``render(id)``。
+        """
+        title = str(meta.get('title') or '').strip()
+        group = str(meta.get('group') or '').strip()
+        if not title:
+            return False
+        try:
+            ok = await page.evaluate("""([t, g]) => {
+                const nodes = Array.from(document.querySelectorAll('.nav-group, .nav-item'));
+                let cur = '';
+                const hits = [];
+                for (const el of nodes) {
+                    if (el.classList && el.classList.contains('nav-group')) {
+                        cur = (el.innerText || '').trim();
+                        continue;
+                    }
+                    if ((el.innerText || '').trim() === t) hits.push({el, g: cur});
+                }
+                if (!hits.length) return false;
+                const pick = g ? (hits.find(h => h.g === g) || hits[0]) : hits[0];
+                pick.el.click();
+                return true;
+            }""", [title, group])
+        except Exception as e:
+            logger.info('[单文件H5] 点击目录条目「%s」异常: %s', title, e)
+            return False
+        if not ok:
+            return False
+        await page.wait_for_timeout(500)
+        return True
+
+    async def _read_runtime_pages(self, page) -> Optional[List[Dict[str, Any]]]:
+        """从单文件原型的运行时 JS 变量读取页面清单（用于补充 states）。
+
+        ⚠️ 2026-11-04 新增（hanakoi v1.10 单文件报告页实测）：
+        该类页面会同时保留「旧版内联 pages 数组」与「运行时 newPages/scopeStates」。
+        正则解析往往先命中旧数组，拿到一堆**已废弃 id**；
+        这些 id 不在页面 ``retained`` 白名单内，``render(id)`` 会被回落成
+        ``create-method``，导致多个画布截到同一张图（视觉产物串页）。
+
+        本函数只用于**补充每个页面的 states**（页面状态清单），
+        页面清单本身以 ``_read_nav_directory`` 为准。
+
+        返回 None 表示该页面没有这些运行时变量（非本格式），调用方沿用正则结果。
+        """
+        try:
+            data = await page.evaluate(self._RUNTIME_PAGES_JS)
+        except Exception as e:
+            logger.info('[单文件H5] 运行时页面清单读取异常: %s', e)
+            return None
+        if not isinstance(data, dict):
+            return None
+        pages = data.get('pages') or []
+        if not pages:
+            return None
+
+        retained = set(str(x) for x in (data.get('retained') or []))
+        kept, dropped = [], []
+        for p in pages:
+            pid = str(p.get('id') or '')
+            if retained and pid not in retained:
+                dropped.append(pid)
+                continue
+            kept.append(p)
+        if dropped:
+            logger.warning(
+                '[单文件H5] 运行时清单中 %d 个页面不在 retained 白名单，已剔除（render 会回落）: %s',
+                len(dropped), '、'.join(dropped[:10]))
+        logger.info('[单文件H5] 运行时页面清单：%d 条（来源 %s，原始 %d）',
+                    len(kept), data.get('source') or '?', len(pages))
+        return kept or None
+
+    async def _capture_singlefile_h5_session(self, url: str, pages_meta: List[Dict[str, Any]],
+                                            cookie_dict: Optional[Dict[str, str]] = None,
+                                            prototype_id: Optional[int] = None):
+        """单次 Playwright 会话快速连拍所有主页面与子状态全景截图，同时读取屏幕 innerText。
+        避免对每个状态反复 launch 浏览器。保持全景视口截图，绝不裁切需求信息。
+
+        ⚠️ 2026-11-04：返回值新增第三项 ``effective_pages_meta`` —— 会话内以左侧目录
+        覆盖后的**实际使用清单**。此前只返回 (screen_texts, shot_manifest)，
+        内部重赋值 ``pages_meta = nav_meta`` 只作用于局部变量，调用方
+        ``_extract_singlefile_h5`` 仍用正则解析出的旧清单去组装页面，
+        导致目录纠正完全失效（表现为页面名仍是「浏览-搜索」这种旧 group-title 格式、
+        且 13 个页面因 screen_texts 取不到而判成「无有效内容」）。
+        """
+        from playwright.async_api import async_playwright
+        screen_texts: Dict[str, str] = {}
+        shot_manifest: Dict[int, Dict[str, Any]] = {}
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                context = await browser.new_context(
+                    viewport={'width': 1440, 'height': 900},
+                    user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                                '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'))
+                if cookie_dict:
+                    cookies = [{'name': k, 'value': v, 'url': url} for k, v in cookie_dict.items()]
+                    await context.add_cookies(cookies)
+
+                page = await context.new_page()
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+                # 左侧目录懒渲染：先等 .nav-item 出现，再交给 _read_nav_directory 做稳定性采样
+                try:
+                    await page.wait_for_selector('.nav-item', timeout=15000, state='attached')
+                except Exception:
+                    logger.info('[单文件H5] 未等到 .nav-item 出现（可能非目录式原型）')
+
+                # ⚠️ 2026-11-04：页面清单以**左侧目录（nav-group + nav-item）为准**。
+                #
+                # 背景（hanakoi v1.10 单文件报告页实测）：
+                #   ① 正则从内联 pages 数组解析出 19 个 id，其中 home/role/creator/
+                #      chats/chatsettings/announcement/likes/favorites/blocked/feedback/
+                #      appearance 共 11 个是**已废弃 id**，不在 retained 白名单里，
+                #      render 时被回落成 'create-method' → 11 个画布截到同一张图；
+                #   ② 运行时 newPages/scopeStates 只有 6+13 条，也覆盖不全；
+                #   ③ 左侧目录 33 条（含 nav-group 分组名）才是作者定义的真实模块目录，
+                #      实测可切出 29 个不同画面，且与业务模块边界完全对应。
+                # 因此：目录优先；目录读不到时才退回运行时清单。
+                nav_meta = None
+                try:
+                    nav_meta = await self._read_nav_directory(page)
+                except Exception as e:
+                    logger.warning('读取左侧目录失败: %s', e)
+                if not nav_meta:
+                    try:
+                        _c = await page.evaluate(
+                            "() => ({nav: document.querySelectorAll('.nav-item').length,"
+                            " grp: document.querySelectorAll('.nav-group').length})")
+                    except Exception:
+                        _c = {}
+                    logger.warning('[单文件H5] 左侧目录不可用（nav-item=%s, nav-group=%s），'
+                                   '退回运行时清单', _c.get('nav'), _c.get('grp'))
+                if nav_meta:
+                    pages_meta = nav_meta
+                    # 用运行时清单补充每个页面的 states（状态清单）
+                    try:
+                        runtime_meta = await self._read_runtime_pages(page)
+                    except Exception:
+                        runtime_meta = None
+                    if runtime_meta:
+                        _st_map = {str(m.get('id')): (m.get('states') or [])
+                                   for m in runtime_meta if m.get('id')}
+                        for m in pages_meta:
+                            if not m.get('states'):
+                                m['states'] = _st_map.get(str(m.get('id')), [])
+                    logger.info(
+                        '[单文件H5] 页面清单以左侧目录为准：%d 条（正则原为 %d 条）',
+                        len(pages_meta), len(pages_meta))
+                else:
+                    try:
+                        runtime_meta = await self._read_runtime_pages(page)
+                    except Exception as e:
+                        runtime_meta = None
+                        logger.warning('读取运行时页面清单失败（沿用正则解析结果）: %s', e)
+                    if runtime_meta:
+                        pages_meta = runtime_meta
+                        logger.info('[单文件H5] 左侧目录不可用，退回运行时清单：%d 条',
+                                    len(pages_meta))
+
+                _blank_pages = []
+                for idx, meta in enumerate(pages_meta, 1):
+                    _raise_if_terminated(prototype_id)
+                    pid = meta.get('id') or f'page{idx}'
+                    states = meta.get('states') or []
+                    page_entry = {'default_shot': None, 'state_shots': []}
+
+                    # 1. 切换并拍摄默认态全景
+                    # 说明（2026-11-04 修正）：优先点击左侧目录条目（真实用户操作路径，
+                    # 实测 33/33 可点），render() 仅作兜底 —— 该页面对 qa-* 有答题守卫、
+                    # 对已废弃 id 有 retained 回落，直接 render 并不可靠。
+                    switched = False
+                    try:
+                        switched = await self._click_nav_entry(page, meta)
+                    except Exception as e:
+                        logger.warning(f"页面[{pid}] 点击目录条目失败: {e}")
+                    if not switched:
+                        try:
+                            await page.evaluate(f"render('{pid}')")
+                            await page.wait_for_timeout(250)
+                        except Exception as e:
+                            logger.warning(f"页面[{pid}] render 失败: {e}")
+
+                    # 读取屏幕文本
+                    try:
+                        stxt = await page.evaluate("""() => {
+                            const el = document.querySelector('.phone') || document.querySelector('.screen') || document.body;
+                            return el ? (el.innerText || el.textContent || '') : '';
+                        }""")
+                        screen_texts[pid] = (stxt or '').strip()
+                    except Exception:
+                        screen_texts[pid] = ''
+
+                    default_shot = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
+                    try:
+                        await page.screenshot(path=default_shot, full_page=False)
+                        page_entry['default_shot'] = default_shot
+                    except Exception as e:
+                        logger.warning(f"默认态截图失败 ws_page_{idx}.png: {e}")
+
+                    # 2. 遍历状态快速切态连拍
+                    for si, st in enumerate(states, 1):
+                        _raise_if_terminated(prototype_id)
+                        st = str(st).strip()
+                        if not st:
+                            continue
+                        switched = False
+                        for js in (
+                            f"render('{pid}');setState('{pid}', '{st}')",
+                            f"render('{pid}');setState('{st}')",
+                            f"setState('{st}')",
+                        ):
+                            try:
+                                await page.evaluate(js)
+                                switched = True
+                                break
+                            except Exception:
+                                continue
+                        if switched:
+                            await page.wait_for_timeout(200)
+                            st_shot = os.path.join(self.shot_dir, f'ws_page_{idx}_st{si}.png')
+                            try:
+                                await page.screenshot(path=st_shot, full_page=False)
+                                page_entry['state_shots'].append({'state': st, 'shot_path': st_shot})
+                            except Exception as e:
+                                logger.warning(f"状态态截图失败 {st_shot}: {e}")
+
+                    shot_manifest[idx] = page_entry
+
+                await browser.close()
+        except Exception as e:
+            logger.error(f"单文件H5 极速连拍会话异常: {e}")
+
+        return screen_texts, shot_manifest, pages_meta
+
+    @staticmethod
+    def _is_image_file_different(path_a: str, path_b: str) -> bool:
+        """轻量级图片差异比对：
+        1. 路径或文件不存在时视为差异（兜底保护）；
+        2. sha256 相同判定为完全无差异；
+        3. 文件大小差异微弱且内容哈希匹配时判定无差异。
+        """
+        if not path_a or not path_b or not os.path.exists(path_a) or not os.path.exists(path_b):
+            return True
+        try:
+            import hashlib
+            with open(path_a, 'rb') as fa, open(path_b, 'rb') as fb:
+                ha = hashlib.sha256(fa.read()).hexdigest()
+                hb = hashlib.sha256(fb.read()).hexdigest()
+                if ha == hb:
+                    return False
+        except Exception:
+            pass
+        return True
+
+    def _plan_visual_jobs(self, shot_manifest: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """为所有页面与状态编排视觉识别任务：
+        主页面默认图 100% 触发 full 视觉识别；
+        子状态图比对默认图，存在差异才派发 incremental 任务，否则直接标记 inherit。
+        """
+        jobs = []
+        for idx, entry in shot_manifest.items():
+            def_shot = entry.get('default_shot')
+            if def_shot:
+                jobs.append({
+                    'page_idx': idx,
+                    'job_type': 'full',
+                    'shot_path': def_shot,
+                    'state': None,
+                })
+
+            for st_info in entry.get('state_shots', []):
+                st_shot = st_info.get('shot_path')
+                st_name = st_info.get('state')
+                if st_shot:
+                    if self._is_image_file_different(def_shot, st_shot):
+                        jobs.append({
+                            'page_idx': idx,
+                            'job_type': 'incremental',
+                            'shot_path': st_shot,
+                            'state': st_name,
+                        })
+                    else:
+                        jobs.append({
+                            'page_idx': idx,
+                            'job_type': 'inherit',
+                            'shot_path': st_shot,
+                            'state': st_name,
+                        })
+        return jobs
+
+    async def _execute_visual_jobs_pool(self, jobs: List[Dict[str, Any]], vision_config,
+                                       prototype_id: Optional[int] = None,
+                                       concurrency: int = 6) -> Dict[int, Dict[str, Any]]:
+        """使用 asyncio.Semaphore 并发调度视觉分析任务。
+        并发调用阿里 DashScope 多模态大模型，复用已有 sha256 缓存。
+        """
+        if not jobs or not vision_config:
+            return {}
+
+        sem = asyncio.Semaphore(concurrency)
+        results_by_page: Dict[int, Dict[str, Any]] = {}
+
+        async def _run_one(job):
+            _raise_if_terminated(prototype_id)
+            pidx = job['page_idx']
+            jtype = job['job_type']
+            spath = job['shot_path']
+            st_name = job.get('state')
+
+            if jtype == 'inherit':
+                return pidx, {'job_type': 'inherit', 'state': st_name, 'result': None}
+
+            async with sem:
+                _raise_if_terminated(prototype_id)
+                try:
+                    res = await self._ocr_screenshot(vision_config, spath)
+                except Exception as e:
+                    logger.warning(f"视觉分析失败 ({spath}): {e}")
+                    res = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                return pidx, {'job_type': jtype, 'state': st_name, 'result': res}
+
+        tasks = [_run_one(j) for j in jobs]
+        completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item in completed:
+            if isinstance(item, Exception):
+                logger.warning(f"视觉并发分析单项发生异常: {item}")
+                continue
+            pidx, data = item
+            if pidx not in results_by_page:
+                results_by_page[pidx] = {
+                    'ocr_text': '',
+                    'visual_summary': '',
+                    'visual_artifacts': [],
+                    'states_data': []
+                }
+
+            jtype = data['job_type']
+            res = data.get('result') or {}
+            st_name = data.get('state')
+
+            if jtype == 'full':
+                results_by_page[pidx]['ocr_text'] = res.get('ocr_text', '')
+                results_by_page[pidx]['visual_summary'] = res.get('visual_summary', '')
+                results_by_page[pidx]['visual_artifacts'] = res.get('visual_artifacts', [])
+            elif jtype == 'incremental' and res:
+                results_by_page[pidx]['states_data'].append({
+                    'state': st_name,
+                    'summary': res.get('visual_summary', ''),
+                    'new_text': res.get('ocr_text', ''),
+                    'artifacts': res.get('visual_artifacts', [])
+                })
+            elif jtype == 'inherit':
+                results_by_page[pidx]['states_data'].append({
+                    'state': st_name,
+                    'summary': '(无结构变更)',
+                    'new_text': '',
+                    'artifacts': []
+                })
+
+        return results_by_page
 
 
     def _extract_singlefile_h5(self, url: str, cookie_dict: Optional[Dict[str, str]] = None,
@@ -1772,14 +2316,35 @@ class ModaoExtractor:
                 pages_meta = _named
                 logger.info(f'[单文件H5单画布重读] 目标画布收敛为 {len(pages_meta)} 张: {sorted(_target_set)}')
 
-        # 手机界面 DOM 文本（免费）：单次 Playwright 会话逐页 render 读 .phone/.screen innerText，
-        # 与模板「需求说明」互补。state 切换需逐状态点击后再读文案，故逐 state 读取。
+        # 1. 单会话复用快速连拍全景截图与屏幕文本提取 (耗时从 ~8分钟骤降至 ~20秒)
+        _proto_id = getattr(self, 'prototype_id', None)
         screen_texts: Dict[str, str] = {}
+        shot_manifest: Dict[int, Dict[str, Any]] = {}
         try:
-            screen_texts = asyncio.run(self._read_singlefile_h5_screen_texts(url, pages_meta))
+            screen_texts, shot_manifest, _effective_meta = asyncio.run(
+                self._capture_singlefile_h5_session(url, pages_meta, cookie_dict=cookie_dict, prototype_id=_proto_id)
+            )
+            # 会话内可能用左侧目录覆盖了页面清单，必须取回实际使用的那一份，
+            # 否则下面组装仍用正则解析出的旧清单（含大量已废弃 id）。
+            if _effective_meta:
+                pages_meta = _effective_meta
         except Exception as e:
-            logger.warning(f'单文件H5 手机界面文本读取失败: {e}')
+            logger.warning(f'单文件H5 会话截图连拍失败，回退为空: {e}')
 
+        # 2. 编排视觉识别任务：主图全量深度识别 + 子状态智能差分
+        visual_jobs = self._plan_visual_jobs(shot_manifest) if vision_config else []
+
+        # 3. 异步并发池化推理 (Semaphore=6 并发加速，彻底消灭串行排队)
+        visual_results: Dict[int, Dict[str, Any]] = {}
+        if visual_jobs and vision_config:
+            try:
+                visual_results = asyncio.run(
+                    self._execute_visual_jobs_pool(visual_jobs, vision_config, prototype_id=_proto_id)
+                )
+            except Exception as e:
+                logger.warning(f'视觉并发分析执行异常: {e}')
+
+        # 4. 组装全景 ModaoPage 结构 (保持 100% 格式对齐，包含完整 bbox 坐标与组件)
         for idx, meta in enumerate(pages_meta, 1):
             try:
                 pid = meta.get('id') or f'page{idx}'
@@ -1790,95 +2355,51 @@ class ModaoExtractor:
                 dom_text = ''
                 if isinstance(tpl_html, str):
                     dom_text = html.unescape(_TAG_RE.sub(' ', tpl_html)).strip()
-                # 合并手机界面 DOM 文本（免费），补上模板「需求说明」未覆盖的界面文案
                 stxt = (screen_texts.get(pid) or '').strip()
                 if stxt:
                     dom_text = (dom_text + '\n[手机界面] ' + stxt).strip()
-                screenshot_path = ''
-                vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
-                vision_text = ''
-                vision_attempted = False
-                page_vision_summary = ''
-                page_vision_artifacts = []
-                # 视觉补充（与 webshare 一致）：双路融合 / 纯图片页 / 混合页时触发。
-                # 单文件 H5 所有页面同 URL，靠 render(pageId) 切页。状态按钮切换时**纯文本内容不变，
-                # 变化的是图片/图标**，因此 OCR 文本与 visual_summary 只取默认态一次（逐状态 OCR 会得到
-                # 重复文本，徒增视觉模型调用开销且叠加噪声）。但每个状态的「图」仍需截图保留为视觉证据：
-                # 这里逐状态切换后仅截图、不调 OCR，最后一张状态截图作为画布代表截图。
-                states = meta.get('states') or []
-                if vision_config and (
-                    dual_fusion or len(dom_text.strip()) < 30 or self._html_has_visual(tpl_html)
-                ):
-                    vision_attempted = True
-                    # 默认态截图 OCR（拿文本 + 视觉摘要）
-                    try:
-                        vision_result = asyncio.run(self._ocr_webshare_page_async(
-                            url, cookie_dict or {}, vision_config, idx,
-                            post_js=f"render('{pid}')", shot_name=f'ws_page_{idx}.png'))
-                    except Exception as e:
-                        vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
-                        logger.warning(f'单文件H5 页面[{page_name}]默认态视觉OCR失败: {e}')
-                    vision_text = vision_result.get('ocr_text', '')
-                    page_vision_summary = vision_result.get('visual_summary', '')
-                    page_vision_artifacts = vision_result.get('visual_artifacts', []) or []
-                    default_ocr_lines = {ln.strip() for ln in (vision_text or '').splitlines() if ln.strip()}
-                    # 逐状态：切换后截图并做完整 OCR，但只保留相对默认态的文本差异
-                    # （避免状态间公共文案重复；同时保留新增提示/错误文案，如登录失败提示）。
-                    for si, st in enumerate(states, 1):
-                        st = str(st).strip()
-                        if not st:
-                            continue
-                        switched = False
-                        st_result = None
-                        for js in (
-                            f"render('{pid}');setState('{pid}', '{st}')",
-                            f"render('{pid}');setState('{st}')",
-                            f"setState('{st}')",
-                        ):
-                            try:
-                                st_result = asyncio.run(self._ocr_webshare_page_async(
-                                    url, cookie_dict or {}, vision_config, idx,
-                                    post_js=js,
-                                    shot_name=f'ws_page_{idx}_st{si}.png',
-                                    summary_only=False))
-                                switched = True
-                                break
-                            except Exception:
-                                continue
-                        if not switched or not st_result:
-                            continue
-                        if st_result.get('visual_summary'):
-                            page_vision_summary = (page_vision_summary
-                                                   + f'\n[状态:{st}]\n' + st_result['visual_summary']).strip()
-                        # 只保留默认态没有的文本行，防止状态间重复叠加
-                        st_ocr_lines = [ln for ln in (st_result.get('ocr_text') or '').splitlines()
-                                        if ln.strip() and ln.strip() not in default_ocr_lines]
-                        if st_ocr_lines:
-                            page_vision_summary = (page_vision_summary
-                                                   + f'\n[状态:{st} 新增文本]\n' + '\n'.join(st_ocr_lines)).strip()
-                            vision_text = (vision_text
-                                           + f'\n[状态:{st}]\n' + '\n'.join(st_ocr_lines)).strip()
-                        # 最后一张状态截图作为该画布代表截图（视觉证据）
-                        st_shot = os.path.join(self.shot_dir, f'ws_page_{idx}_st{si}.png')
-                        if os.path.exists(st_shot):
-                            screenshot_path = os.path.relpath(st_shot, self.media_root)
-                vision_success = bool(
-                    vision_text
-                    or page_vision_summary
-                    or page_vision_artifacts
-                )
+
+                vdata = visual_results.get(idx) or {}
+                vision_text = vdata.get('ocr_text', '')
+                page_vision_summary = vdata.get('visual_summary', '')
+                page_vision_artifacts = list(vdata.get('visual_artifacts') or [])
+
+                # 融合子状态增量视觉文本与组件坐标
+                states_info = vdata.get('states_data', [])
+                for st_item in states_info:
+                    st_name = st_item.get('state')
+                    st_sum = st_item.get('summary')
+                    st_txt = st_item.get('new_text')
+                    if st_sum and st_sum != '(无结构变更)':
+                        page_vision_summary = (page_vision_summary + f'\n[状态:{st_name}]\n' + st_sum).strip()
+                    if st_txt:
+                        vision_text = (vision_text + f'\n[状态:{st_name}]\n' + st_txt).strip()
+                    if st_item.get('artifacts'):
+                        page_vision_artifacts.extend(st_item['artifacts'])
+
+                # 代表截图优先取状态截图或默认全景
+                entry = shot_manifest.get(idx) or {}
+                st_shots = entry.get('state_shots', [])
+                shot_file = st_shots[-1]['shot_path'] if st_shots else entry.get('default_shot')
+                if not shot_file or not os.path.exists(shot_file):
+                    shot_file = entry.get('default_shot')
+                screenshot_path = os.path.relpath(shot_file, self.media_root) if shot_file and os.path.exists(shot_file) else ''
+
+                vision_attempted = bool(vision_config)
+                vision_success = bool(vision_text or page_vision_summary or page_vision_artifacts)
+
                 text = (dom_text or '')
                 if vision_text:
                     text = text + '\n[视觉OCR补充]\n' + vision_text
-                rendered_shot = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
-                if os.path.exists(rendered_shot) and not screenshot_path:
-                    screenshot_path = os.path.relpath(rendered_shot, self.media_root)
+
                 page_vision_text = vision_text or ''
                 if page_vision_summary:
                     page_vision_text = (page_vision_text + '\n' + page_vision_summary).strip()
+
                 pages.append({
                     'page_no': idx,
                     'page_name': page_name,
+                    '_src_id': pid,          # 内部字段：用于按 screen_texts 归并同画面入口
                     'text': text,
                     'dom_text': dom_text,
                     'vision_text': page_vision_text,
@@ -1889,7 +2410,7 @@ class ModaoExtractor:
                     'screenshot': screenshot_path,
                     'visual_summary': page_vision_summary,
                     'visual_artifacts': page_vision_artifacts,
-                    'states': states,
+                    'states': meta.get('states') or [],
                     'extraction_warnings': (
                         ['视觉识别未返回有效内容']
                         if vision_attempted and not vision_success else []
@@ -1907,6 +2428,58 @@ class ModaoExtractor:
                     'visual_artifacts': [],
                     'extraction_warnings': [str(e)],
                 })
+
+        # ── B 方案：合并「多个入口指向同一画面」的重复页 ──
+        # 实测 hanakoi v1.10：33 个导航入口里只有 29 个唯一画面，
+        # 「个人中心 / 创作者主页 / 用户资料编辑」三个入口点开是同一屏，
+        # 「启动页 / 搜索」、「首页·每日花瓣领取 / 首页角色分类设置」同理。
+        # 若保留多份，会让测试点重复生成（同一画面产出 3 套用例）。
+        # 处理：按屏幕文本指纹归并，保留首条为主页，其余记为 alias；
+        # 主页面名称取该组第一个入口（导航顺序即业务顺序）。
+        # 空内容入口（如「1.0遗留问题」无有效正文）单独告警，不参与需求。
+        if len(pages) > 1 and screen_texts:
+            _sig_map: Dict[str, List[Dict[str, Any]]] = {}
+            for pg in pages:
+                _pid = str(pg.get('_src_id') or '')
+                _stxt = (screen_texts.get(_pid) or '').strip()
+                # 文本过短视为无效页（空壳/仅状态栏），不参与合并判定
+                if len(_stxt) < 20:
+                    pg.setdefault('extraction_warnings', []).append(
+                        '画布无有效正文内容，未纳入需求分析')
+                    _sig_map.setdefault('__blank__' + str(pg.get('page_no')), []).append(pg)
+                    continue
+                _sig = hashlib.sha256(_stxt.encode('utf-8')).hexdigest()
+                _sig_map.setdefault(_sig, []).append(pg)
+
+            _merged: List[Dict[str, Any]] = []
+            _blank: List[Dict[str, Any]] = []
+            _dup_group_count = 0
+            for _sig, _group in _sig_map.items():
+                if _sig.startswith('__blank__'):
+                    _blank.extend(_group)
+                    continue
+                _head = _group[0]
+                if len(_group) > 1:
+                    _dup_group_count += 1
+                    _head['aliases'] = [g.get('page_name') for g in _group[1:]]
+                    _head.setdefault('extraction_warnings', []).append(
+                        '与 %s 为同一画面（多入口指向同一页），已合并为一条'
+                        % '、'.join(g.get('page_name') for g in _group[1:]))
+                    logger.info('[单文件H5] 合并同画面入口：%s ← %s',
+                                _head.get('page_name'),
+                                [_g.get('page_name') for _g in _group[1:]])
+                _merged.append(_head)
+            if _blank:
+                warnings.append(
+                    '有 %d 个入口无有效画面内容，未纳入需求分析：%s'
+                    % (len(_blank), '、'.join(str(b.get('page_name')) for b in _blank)))
+            if _dup_group_count:
+                logger.info('[单文件H5] 页面去重：%d → %d（合并同画面入口 %d 组）',
+                            len(pages), len(_merged), _dup_group_count)
+            pages = _merged
+            for _i, _pg in enumerate(pages, 1):
+                _pg['page_no'] = _i
+                _pg.pop('_src_id', None)
 
         # 单文件 H5：所有画布共用同一份左侧全局导航（目录列表），
         # 而画布本就是按模块拆分的，导航无独立信息价值 → 从每个画布文本中剔除。
@@ -2203,6 +2776,58 @@ class ModaoExtractor:
         except Exception:
             return ''
 
+    async def _fingerprint_distance(page, ref_bytes: bytes = None) -> float:
+        """估算当前视口相对参照图的差异比例（0~1），用于排除"微小动画差异"误判切换。
+
+        取参照图 ``ref_bytes``（点击前截的图）与当前视口各降采样为 32x32 灰度，
+        统计灰度差 > 8 的像素占比，即为差异比例。
+
+        同时再取一张"当前 vs 当前（相隔 400ms）"的抖动基线：若页面本身在动
+        （加载动画/时钟/光标），基线抖动会偏高，此时把有效阈值抬高到
+        ``max(_MIN_VIEWPORT_DIFF_RATIO, jitter * 2)``，避免被噪声蒙混过关。
+
+        返回实际差异比例；调用方用 ``returned >= effective_threshold`` 判定。
+        截图失败返回 1.0（宁可放过，也不误杀真实切换）。
+        """
+        try:
+            import io
+            from PIL import Image
+            ref_bytes = ref_bytes or b''
+            cur1 = await page.screenshot(full_page=False)
+            await page.wait_for_timeout(400)
+            cur2 = await page.screenshot(full_page=False)
+
+            def _gray(buf):
+                im = Image.open(io.BytesIO(buf)).convert('L')
+                # 裁掉左侧导航栏（占宽约 22%）：单文件 HTML 报告页的导航选中态
+                # 会随点击变化，但画布可能根本没切换，直接全图比较会被导航差异干扰。
+                # 同时提高采样到 64x64，避免画布细节被降采样平均掉。
+                w, h = im.size
+                if w > 200:
+                    im = im.crop((int(w * 0.22), 0, w, h))
+                return im.resize((64, 64))
+
+            def _ratio(im_a, im_b):
+                da, db = list(im_a.getdata()), list(im_b.getdata())
+                n = float(len(da) or 1)
+                return sum(1 for a, b in zip(da, db) if abs(a - b) > 8) / n
+
+            g_ref, g_c1, g_c2 = _gray(ref_bytes), _gray(cur1), _gray(cur2)
+            jitter = _ratio(g_c1, g_c2)
+            actual = _ratio(g_ref, g_c1)
+            self._last_jitter = jitter
+            logger.info('[切换] 视口差异=%.4f 同页抖动=%.4f（抖动高说明页面在动）',
+                        actual, jitter)
+            return actual
+        except Exception as e:
+            logger.info('[切换] 视口差异估算失败（按通过处理）: %s', e)
+            return 1.0
+
+    def _effective_diff_threshold(self) -> float:
+        """有效视口差异阈值：页面本身在动时抬高门槛，避免被动画噪声蒙混。"""
+        jitter = float(getattr(self, '_last_jitter', 0.0) or 0.0)
+        return max(_MIN_VIEWPORT_DIFF_RATIO, jitter * 2.0)
+
     _MODAO_ACTIVE_CID_JS = '''() => {
         const a = document.querySelector('.rn-list-item.active, li.rn-content-item.active');
         if (!a) return null;
@@ -2297,13 +2922,24 @@ class ModaoExtractor:
         return {body: body.slice(0, 300), sticky: sticky.slice(0, 60)};
     }'''
 
-    async def _activate_page_item(self, page, item, other_items=None, item_cid: str = '') -> bool:
+    async def _activate_page_item(self, page, item, other_items=None, item_cid: str = '',
+                                  on_note=None) -> bool:
         """点击页面树条目，并确认画布确实切换到了目标。
 
-        【校验优先级】active_cid 精确比对 > 视口指纹对比。
-        指纹对比不可靠：相邻/同名画布（如两个「竖版」）内容相近时，即使切换成功
-        视口指纹也可能不变；反之切换失败时指纹却可能因动画而变。用页面上
-        `.active` 项的 data-cid 与目标 cid 直接比对才准确无误（这也是撞图的根治手段）。
+        【校验优先级】active_cid 精确比对 > 视口指纹差异（需足够大）。
+
+        ⚠️ 2026-11-04 修正（proto=93 单文件 HTML 报告页实测）：
+        该格式下页面树元素**没有 data-cid**，``item_cid`` 恒为空，于是原有
+        「精确校验」整段被 ``if item_cid:`` 跳过，只剩视口指纹兜底；
+        而报告页的视口几乎不变，光标记时/加载动画/滚动条产生的微小差异
+        又足以让 ``before != after`` 成立 → 19 个画布全部误判"切换成功"、
+        无任何 warning，最终截图/visual_artifacts 大范围串页
+        （19 个画布只截出 8 张不同图）。
+
+        现在 ``item_cid`` 为空时启用**强证据模式**：视口差异必须超过
+        ``_MIN_VIEWPORT_DIFF_RATIO`` 才算切换成功，否则继续重试并最终返回 False，
+        由上层保留该页并交给「截图重复检测」（_mark_duplicate_screenshots）
+        做最后判定，不再静默当成成功。
 
         重试策略（单纯重复点击同一 item 对墨刀无效——墨刀判定「当前已在该画布
         状态」时对同名/相邻项点击不会重新渲染）：
@@ -2311,8 +2947,14 @@ class ModaoExtractor:
           2. 重试轮：先点一个**其他**画布制造状态差，等墨刀渲染，**再点回目标**。
 
         item_cid 为目标画布的 data-cid（调用方从 item 上读取后传入）；为空时
-        退化为仅指纹对比（兼容旧调用）。
+        退化为强证据指纹对比（兼容无 data-cid 的原型格式）。
+        on_note: 可选回调，用于把降级说明写进该页的 extraction_warnings。
         """
+        require_strong_proof = not item_cid
+        if require_strong_proof:
+            logger.warning(
+                '[切换] 目标页面项无 data-cid，改用强证据视口差异判定（阈值 %.3f）',
+                _MIN_VIEWPORT_DIFF_RATIO)
         try:
             await page.keyboard.press('Escape')
             await page.wait_for_timeout(200)
@@ -2325,6 +2967,13 @@ class ModaoExtractor:
             except Exception:
                 return ''
         before = await self._viewport_fingerprint(page)
+        # 强证据模式需要原始字节做像素级差异比较（sha256 无法反推图像）
+        before_bytes = b''
+        if require_strong_proof:
+            try:
+                before_bytes = await page.screenshot(full_page=False)
+            except Exception:
+                before_bytes = b''
 
         async def _emit_click(target, mode: int) -> None:
             """按 mode 用不同方式触发点击，逐级兜底。
@@ -2373,8 +3022,22 @@ class ModaoExtractor:
                         if ac:
                             logger.info(f'[切换] 点击后激活了 {ac}，目标为 {item_cid}，继续重试')
                     # 2) 兜底：视口指纹对比
+                    #    ⚠️ 2026-11-04：视口指纹是**弱判据**，单文件 HTML 报告页里
+                    #    光标记时、加载动画、滚动条等都会让截图产生微小差异，
+                    #    从而把"没切换"误判成"切换成功"。因此要求指纹差异足够大
+                    #    （见 _fingerprint_distance），且 item_cid 为空时记录告警，
+                    #    让上层"截图重复检测"成为最后一道防线。
                     after = await self._viewport_fingerprint(page)
                     if before and after and before != after:
+                        if require_strong_proof:
+                            dist = await self._fingerprint_distance(page, before_bytes)
+                            if dist < self._effective_diff_threshold():
+                                logger.info(
+                                    '[切换] 视口差异过小(%.4f < %.4f)，判定未真正切换画布',
+                                    dist, self._effective_diff_threshold())
+                                continue
+                            if on_note:
+                                on_note('已通过视口差异判定切换（该原型无 data-cid 精确校验）')
                         return True
                 except Exception:
                     continue
@@ -2383,17 +3046,54 @@ class ModaoExtractor:
         return False
 
     def _mark_duplicate_screenshots(self, pages: List[Dict[str, Any]]) -> List[List[int]]:
-        """标记字节完全相同的截图；保留页面供审计，但明确标为读取异常。"""
+        """标记内容完全相同的截图；保留页面供审计，但明确标为读取异常。
+
+        ⚠️ 2026-11-04 修正（proto=93 实测）：原实现只看截图文件字节哈希，
+        而 ``MEDIA_ROOT`` 是**相对路径**（值为 ``'media'``），一旦调用方工作目录
+        不是项目根，``os.path.exists`` 全部返 False 就 ``continue`` ——
+        结果 ``screenshot_sha256`` 全为空、重复组为空、warnings 为空，
+        重复检测**完全静默失效**（实测 19 画布只截出 8 张不同图，重复率 58%，
+        却一路判成功，导致每个画布的 visual_artifacts 混入同一份内容）。
+
+        现在改为三重判据，任一命中即视为重复：
+          1) 截图文件字节 sha256（文件可读时最可靠）；
+          2) 截图相对路径本身相同（文件不可读时的兜底，同名字即同图）；
+          3) ``visual_artifacts`` 内容签名相同（内容级判据，不依赖文件系统）。
+        并统计"无法读取文件的页数"，超过半数时显式告警，不再静默跳过。
+        """
         groups: Dict[str, List[Dict[str, Any]]] = {}
+        unreadable = 0
         for page_data in pages:
             rel_path = page_data.get('screenshot') or ''
             abs_path = os.path.join(self.media_root, rel_path) if rel_path else ''
-            if not abs_path or not os.path.exists(abs_path):
-                continue
-            with open(abs_path, 'rb') as fh:
-                digest = hashlib.sha256(fh.read()).hexdigest()
-            page_data['screenshot_sha256'] = digest
+            digest = ''
+            if abs_path and os.path.exists(abs_path):
+                try:
+                    with open(abs_path, 'rb') as fh:
+                        digest = hashlib.sha256(fh.read()).hexdigest()
+                    page_data['screenshot_sha256'] = digest
+                except Exception as e:
+                    logger.warning('截图哈希计算失败（回退内容判据）: %s', e)
+                    digest = ''
+            if not digest:
+                unreadable += 1
+                # 兜底判据：内容签名（visual_artifacts 归一化）优先，其次相对路径
+                va = page_data.get('visual_artifacts') or []
+                if va:
+                    digest = 'artifacts:' + hashlib.sha256(
+                        json.dumps(va, ensure_ascii=False, sort_keys=True).encode('utf-8')
+                    ).hexdigest()
+                elif rel_path:
+                    digest = 'path:' + hashlib.sha256(rel_path.encode('utf-8')).hexdigest()
+                else:
+                    continue
             groups.setdefault(digest, []).append(page_data)
+
+        if pages and unreadable > len(pages) / 2:
+            logger.warning(
+                '[EXTRACT] %d/%d 页截图文件不可读，重复检测已回退到内容/路径判据'
+                '（media_root=%s，请确认工作目录与 MEDIA_ROOT 一致）',
+                unreadable, len(pages), self.media_root)
 
         duplicates = []
         for same_pages in groups.values():
@@ -2403,7 +3103,7 @@ class ModaoExtractor:
             duplicates.append(page_nos)
             for page_data in same_pages[1:]:
                 page_data.setdefault('extraction_warnings', []).append(
-                    f'截图与第{page_nos[0]}页完全一致，未计为独立有效页面'
+                    f'画布内容与第{page_nos[0]}页完全一致，未计为独立有效页面'
                 )
                 page_data['duplicate_of_page'] = page_nos[0]
         return duplicates

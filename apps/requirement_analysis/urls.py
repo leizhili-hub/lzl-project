@@ -31,7 +31,7 @@ from .modao_views import (
     modao_page_edit, modao_ask, modao_adopt,
     modao_adopt_single,
     modao_log_viewer, modao_log_raw,
-    modao_export_xmind, modao_import_xmind,
+    modao_export_xmind, modao_import_xmind, modao_export_smoke_zentao,
     modao_page_reset,
     modao_folders, modao_select_by_folder,
 )
@@ -93,6 +93,7 @@ urlpatterns = [
     path('api/modao/<int:pk>/ask/', modao_ask, name='modao-ask'),
     path('api/modao/<int:pk>/', modao_detail, name='modao-detail'),
     path('api/modao/<int:pk>/export-xmind/', modao_export_xmind, name='modao-export-xmind'),
+    path('api/modao/<int:pk>/export-smoke-zentao/', modao_export_smoke_zentao, name='modao-export-smoke-zentao'),
     path('api/modao/<int:pk>/import-xmind/', modao_import_xmind, name='modao-import-xmind'),
     path('api/modao/<int:pk>/excel/', modao_excel, name='modao-excel'),
     path('api/modao/<int:pk>/adopt/', modao_adopt, name='modao-adopt'),

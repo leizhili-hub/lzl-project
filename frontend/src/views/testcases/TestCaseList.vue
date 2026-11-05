@@ -114,18 +114,34 @@
             </el-select>
           </div>
           <div class="filter-item filter-item--module">
-            <el-select v-model="featureModuleFilter" placeholder="功能模块" clearable :disabled="!projectFilter" @change="handleFeatureModuleChange" size="default" class="module-select">
+            <el-select v-model="featureModuleFilter" placeholder="功能模块" clearable filterable :disabled="!projectFilter" @change="handleFeatureModuleChange" size="default" class="module-select">
+              <el-option-group v-if="featureModuleGroups.used && featureModuleGroups.used.length" label="✅ 本版本用例在用">
+                <el-option v-for="fm in featureModuleGroups.used" :key="'used-' + fm.id" :label="fm.name" :value="fm.id" />
+              </el-option-group>
               <el-option-group v-if="featureModuleGroups.version.length" :label="`已关联 ${selectedVersionName}`">
                 <el-option v-for="fm in featureModuleGroups.version" :key="fm.id" :label="fm.name" :value="fm.id" />
               </el-option-group>
               <el-option-group v-if="featureModuleGroups.unassociated.length" label="未关联版本">
                 <el-option v-for="fm in featureModuleGroups.unassociated" :key="fm.id" :label="fm.name" :value="fm.id" />
               </el-option-group>
+              <el-option-group v-if="featureModuleGroups.other && featureModuleGroups.other.length" label="关联了其他版本">
+                <el-option v-for="fm in featureModuleGroups.other" :key="'other-' + fm.id" :label="fm.name" :value="fm.id" />
+              </el-option-group>
               <el-option v-for="fm in featureModuleGroups.all" :key="fm.id" :label="fm.name" :value="fm.id" />
             </el-select>
             <el-button size="small" circle @click="openQuickCreateFeatureModule" title="快速新建功能模块" class="quick-add-btn">
               <el-icon><Plus /></el-icon>
             </el-button>
+          </div>
+          <div class="filter-item">
+            <el-select v-model="sourceCanvasFilter" placeholder="来源画布" clearable filterable :disabled="!projectFilter" @change="handleFilter" size="default">
+              <el-option v-for="c in sourceTagOptions.canvases" :key="c" :label="c.replace('画布:', '')" :value="c" />
+            </el-select>
+          </div>
+          <div class="filter-item">
+            <el-select v-model="sourceFolderFilter" placeholder="来源文件夹" clearable filterable :disabled="!projectFilter" @change="handleFilter" size="default">
+              <el-option v-for="f in sourceTagOptions.folders" :key="f" :label="f.replace('文件夹:', '')" :value="f" />
+            </el-select>
           </div>
         </div>
         <!-- Row 2: 测试点（功能模块下级） + 操作区 -->
@@ -475,6 +491,12 @@ const tagsFilter = ref(route.query.tags || '')
 const versionFilter = ref(parseNum(route.query.version))
 const featureModuleFilter = ref(parseNum(route.query.feature_module))
 const testPointFilter = ref(parseNum(route.query.test_point))
+// 来源筛选（墨刀采纳时把来源写入用例 tags：画布:P{n} {name} / 文件夹:{folder}）
+const sourceCanvasFilter = ref(route.query.source_canvas || '')
+const sourceFolderFilter = ref(route.query.source_folder || '')
+const sourceTagOptions = ref({ canvases: [], folders: [] })
+// 本版本用例实际在用的功能模块（优先展示；修复按版本分组时「已用模块因归属其他版本而消失」的问题）
+const usedModules = ref([])
 const allVersions = ref([])
 const allFeatureModules = ref([])
 const allTestPoints = ref([])
@@ -631,7 +653,7 @@ const fetchTestCases = async () => {
       project: projectFilter.value,
       priority: priorityFilter.value,
       status: statusFilter.value,
-      tags: tagsFilter.value,
+      tags: combinedTags.value,
       version: versionFilter.value,
       feature_module: featureModuleFilter.value,
       test_point: testPointFilter.value
@@ -666,6 +688,9 @@ const handleProjectFilterChange = () => {
   versionFilter.value = ''
   featureModuleFilter.value = ''
   testPointFilter.value = ''
+  sourceCanvasFilter.value = ''
+  sourceFolderFilter.value = ''
+  usedModules.value = []
   allTestPoints.value = []
   selectAllMode.value = false
   currentPage.value = 1
@@ -673,6 +698,7 @@ const handleProjectFilterChange = () => {
   fetchTestCases()
   // 切换项目后刷新功能模块下拉（按新项目过滤）
   fetchFeatureModules(projectFilter.value)
+  fetchSourceTags()
 }
 
 const handleFeatureModuleChange = () => {
@@ -692,11 +718,48 @@ const handleFeatureModuleChange = () => {
 const handleVersionFilterChange = () => {
   featureModuleFilter.value = ''
   testPointFilter.value = ''
+  sourceCanvasFilter.value = ''
+  sourceFolderFilter.value = ''
   allTestPoints.value = []
   selectAllMode.value = false
   currentPage.value = 1
   syncFiltersToUrl()
   fetchTestCases()
+  fetchUsedModules()
+  fetchSourceTags()
+}
+
+// 拉取「本版本用例实际在用」的功能模块（置顶多分组）
+const fetchUsedModules = async () => {
+  if (!versionFilter.value) {
+    usedModules.value = []
+    return
+  }
+  try {
+    const params = { used_with_version: versionFilter.value }
+    if (projectFilter.value) params.project = projectFilter.value
+    const response = await api.get('/feature-modules/', { params })
+    usedModules.value = response.data.results || response.data || []
+  } catch (error) {
+    console.error('获取本版本在用模块失败:', error)
+    usedModules.value = []
+  }
+}
+
+// 拉取来源画布/来源文件夹筛选项（后端聚合当前项目+版本下用例 tags 中的来源标签）
+const fetchSourceTags = async () => {
+  if (!projectFilter.value) {
+    sourceTagOptions.value = { canvases: [], folders: [] }
+    return
+  }
+  try {
+    const params = { project: projectFilter.value }
+    if (versionFilter.value) params.version = versionFilter.value
+    const response = await api.get('/testcases/source-tags/', { params })
+    sourceTagOptions.value = response.data || { canvases: [], folders: [] }
+  } catch (error) {
+    console.error('获取来源筛选项失败:', error)
+  }
 }
 
 // 根据选中项目过滤的版本列表
@@ -720,7 +783,9 @@ const selectedVersionName = computed(() => {
   return v ? v.name : ''
 })
 
-// 功能模块下拉分组：属于选中版本的归「已关联」，未填写版本的归「未关联版本」
+// 功能模块下拉分组：属于选中版本的归「已关联」，未填写版本的归「未关联版本」，
+// 关联了其他版本的归「其他」（此前会被整个丢弃，导致用户筛不到想看的模块）。
+// 「本版本用例在用」来自 usedModules（该版本下用例实际关联的模块），置顶展示。
 const featureModuleGroups = computed(() => {
   // 选了版本 → 按版本关联分组
   if (versionFilter.value) {
@@ -729,35 +794,48 @@ const featureModuleGroups = computed(() => {
     const projectIds = (version && version.projects) ? version.projects.map(p => p.id) : []
     const versionMods = []
     const unassociated = []
+    const other = []
     for (const fm of allFeatureModules.value) {
       const pid = fm.project ? fm.project.id : fm.project_id
       if (projectIds.length && !projectIds.includes(pid)) continue
       const versions = fm.versions || []
       if (versions.some(v => v.id === vid)) versionMods.push(fm)
       else if (versions.length === 0) unassociated.push(fm)
+      else other.push(fm)
     }
-    return { version: versionMods, unassociated, all: [] }
+    return { used: usedModules.value, version: versionMods, unassociated, other, all: [] }
   }
   // 只选了项目 → 该项目下所有模块（扁平）
   if (projectFilter.value) {
     const pid = Number(projectFilter.value)
     return {
+      used: [],
       version: [],
       unassociated: [],
+      other: [],
       all: allFeatureModules.value.filter(fm => {
         const fpid = fm.project ? fm.project.id : fm.project_id
         return fpid === pid
       })
     }
   }
-  return { version: [], unassociated: [], all: [] }
+  return { used: [], version: [], unassociated: [], other: [], all: [] }
+})
+
+// 用例类别 + 来源画布 + 来源文件夹 合并为逗号分隔的 tags 参数（后端按「且」过滤）
+const combinedTags = computed(() => {
+  const arr = []
+  if (tagsFilter.value) arr.push(tagsFilter.value)
+  if (sourceCanvasFilter.value) arr.push(sourceCanvasFilter.value)
+  if (sourceFolderFilter.value) arr.push(sourceFolderFilter.value)
+  return arr.join(',')
 })
 
 // 是否有激活的筛选器
 const hasActiveFilters = computed(() => {
   return searchText.value || projectFilter.value || priorityFilter.value ||
     statusFilter.value || tagsFilter.value || versionFilter.value || featureModuleFilter.value ||
-    testPointFilter.value
+    testPointFilter.value || sourceCanvasFilter.value || sourceFolderFilter.value
 })
 
 // 重置所有筛选器
@@ -770,6 +848,9 @@ const resetAllFilters = () => {
   versionFilter.value = ''
   featureModuleFilter.value = ''
   testPointFilter.value = ''
+  sourceCanvasFilter.value = ''
+  sourceFolderFilter.value = ''
+  usedModules.value = []
   allTestPoints.value = []
   selectAllMode.value = false
   tableRef.value?.clearSelection()
@@ -789,6 +870,8 @@ const syncFiltersToUrl = () => {
   if (versionFilter.value) query.version = versionFilter.value
   if (featureModuleFilter.value) query.feature_module = featureModuleFilter.value
   if (testPointFilter.value) query.test_point = testPointFilter.value
+  if (sourceCanvasFilter.value) query.source_canvas = sourceCanvasFilter.value
+  if (sourceFolderFilter.value) query.source_folder = sourceFolderFilter.value
   if (currentPage.value > 1) query.page = String(currentPage.value)
   router.replace({ query })
 }
@@ -1403,20 +1486,20 @@ const handleImportFileChange = (uploadFile) => {
           }
           return ''
         }
-        const title = get('用例标题', 'title')
-        const expected = get('预期结果', 'expected_result', 'expectedResult')
+        const title = get('用例标题', '标题', 'title')
+        const expected = get('预期结果', '预期', 'pass_criteria', 'expected_result', 'expectedResult')
         cases.push({
           title,
           expected_result: expected,
           description: get('用例描述', '描述', 'description'),
           preconditions: get('前置条件', 'preconditions'),
-          steps: get('操作步骤', 'steps'),
+          steps: get('操作步骤', '步骤', 'steps'),
           priority: get('优先级', 'priority'),
           status: get('状态', 'status'),
-          test_type: get('测试类型', 'testType'),
-          feature_modules: get('功能模块', 'featureModules'),
+          test_type: get('测试类型', '用例类型', 'testType'),
+          feature_modules: get('功能模块', '所属模块', '模块', 'featureModules'),
           test_point: get('测试点', 'testPoint'),
-          tags: get('标签', 'tags')
+          tags: get('标签', '关键词', 'tags')
         })
         if (title && expected) valid++
         else invalid++
@@ -1497,6 +1580,9 @@ onMounted(async () => {
   fetchVersions()
   // 关键：先加载功能模块列表，等 options 就位后再恢复筛选值渲染
   await fetchFeatureModules(projectFilter.value)
+  // 来源筛选项 + 本版本在用模块（依赖已恢复的项目/版本筛选值）
+  fetchSourceTags()
+  fetchUsedModules()
   // 如果 URL 中恢复了功能模块筛选，加载对应的测试点列表
   if (featureModuleFilter.value) {
     await fetchTestPoints(featureModuleFilter.value)

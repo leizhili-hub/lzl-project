@@ -80,10 +80,28 @@ def _extract_block(content: str, lang: str = None) -> str:
     - 标记后不紧跟换行（如 ` ```json{...} `）
     - 缺少结束 ``` 标记（截至文末）
     - 无代码块时返回原文（供 _parse_json/_parse_yaml 直接解析裸 JSON/YAML）
+
+    ⚠️ 2026-11-04 修正（proto=92 事故）：文档**本身已是完整裸 YAML/JSON** 时，
+    绝不能因为正文中途出现 ```（例如某个字段原文里带了代码围栏）就把它当边界截断。
+    旧行为在这些场景下只返回「首个围栏内的几千字」，把 27k 行的全局摘要截成 1 个模块。
+    现策略：整份内容本身能解析成功就直接用整份；解析不了才回退到「提取首个代码块」。
     """
     if not content:
         return ''
     import re
+    # 先判断整份内容是否本身就是合法载荷（裸 YAML/JSON），是则不做任何截取
+    body = content.strip()
+    if body and not body.startswith('```'):
+        try:
+            if lang and re.search(r'(yaml|yml)', lang, re.I):
+                import yaml as _yaml
+                if isinstance(_yaml.safe_load(_strip_yaml_fence(body)), (dict, list)):
+                    return _strip_yaml_fence(body)
+            elif lang and re.search(r'json', lang, re.I):
+                if isinstance(json.loads(body), (dict, list)):
+                    return body
+        except Exception:
+            pass
     # 结束定界符：优先 ```，否则匹配到字符串末尾（兼容未闭合代码块）
     end = r'(?:```|$)'
     if lang:
@@ -108,6 +126,11 @@ def _repair_yaml_text(text: str) -> str:
 
     这里只对这类「引号成对出现、但闭合引号后仍有内容」的行做整体加引号修复，
     合法 YAML 行原样透传，不做任何其他改动。
+
+    另修一类（2026-11-04 proto=92 实测，画布「个人-个人中心」整段因此解析失败）：
+    ``priority_reason: "…新增"编辑篇章"入口…"`` —— 双引号字符串**内部又出现未转义双引号**。
+    判据：值以引号开头且以同种引号结尾，但中间还存在该引号。
+    修法：保留首尾引号，把中间的同种引号替换成中文引号（不改语义、不引入转义转义问题）。
     """
     import json as _json
     import re as _re
@@ -115,12 +138,147 @@ def _repair_yaml_text(text: str) -> str:
     for line in (text or '').split('\n'):
         # 兼容列表项形如 `- "xxx" yyy` 或 键值形如 `key: "xxx" yyy`
         m = _re.match(r'^(\s*(?:-\s*|[\w_]+:\s*))(["\'])(.*?)\2(.*)$', line)
+        # ⚠️ 排除 YAML 单引号转义串 `'''xxx''yy'`：它以两个同种引号开头，
+        # 属于合法写法，不能按「引号半包裹」重写（2026-11-04 proto=92 画布1 误伤）
+        # 判据直接看「前缀之后是否紧跟两个同种引号」（group(3) 可能为空串，不能用它判）
+        if m:
+            q_m = m.group(2)
+            rest = line[len(m.group(1)):]
+            if rest.startswith(q_m * 2):
+                out.append(line)
+                continue
         if m and m.group(4).strip():
             # 引号后还有裸文本：把引号内 + 引号外拼接后整体 JSON 转义（JSON 字符串是合法 YAML 标量）
             out.append(m.group(1) + _json.dumps(m.group(3) + m.group(4), ensure_ascii=False))
-        else:
-            out.append(line)
+            continue
+        # 值已用引号包裹，但内部还夹着同种引号 → 内部引号换成中文引号
+        # 形态覆盖：`key: "…"`、`- "…"`、`- key: "…"`（含尾随多余引号）
+        # ⚠️ 必须严格限定「值紧跟分隔符就是引号」，否则会误伤：
+        #   - `- 角色创作模块新增"心动角色测验"草稿类型…`（裸值，引号在中间，本已合法）
+        #   - `issue: '''下次进入页面''是否指…'`（三引号，本已合法）
+        m2 = _re.match(r'^(\s*(?:-\s+)?[\w_\u4e00-\u9fa5]+\s*:\s*|^\s*-\s+)(["\'])(.*)$', line)
+        if m2 and m2.group(2) in m2.group(3):
+            q, body = m2.group(2), m2.group(3)
+            # 三引号开头（YAML 里等价于单引号转义串）不处理，避免语义被改
+            if body.startswith(q):
+                out.append(line)
+                continue
+            # body 形如 `内容"编辑篇章""` 或 `内容"` —— 去掉尾部所有多余的同类引号，
+            # 只保留我们最后补的那一个
+            while body.endswith(q):
+                body = body[:-1]
+            fixed = body.replace(q, '\u201c' if q == '"' else '\u2018')
+            out.append(m2.group(1) + q + fixed + q)
+            continue
+        out.append(line)
     return '\n'.join(out)
+
+
+def _strip_yaml_fence(text: str) -> str:
+    """剥掉整份文档外层残留的 ```yaml / ``` 代码围栏。
+
+    背景（2026-11-04 生产 proto=92 实测）：落库的 requirement_summary / page_summary
+    偶发把 LLM 原样输出连代码围栏一起存了下来，`yaml.safe_load` 在围栏行直接抛
+    ``found character '`' that cannot start any token``，整份 27k 行文档解析失败，
+    阶段3 模块拆分会退化成「0 个模块」或只吃到某段围栏内的内容。
+
+    只处理「首行是围栏」与「末行是围栏」两种情形：
+    - 首行围栏 + 末行围栏 → 去掉首尾行；
+    - 仅首行围栏（末行被截断）→ 去掉首行。
+    文档中间的围栏不动（那是内容，不是边界），以免误删正文。
+    """
+    if not text:
+        return ''
+    lines = text.split('\n')
+    # 找到首个非空行
+    start = 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start < len(lines) and lines[start].strip().startswith('```'):
+        lines = lines[start + 1:]
+        # 末尾若也是围栏则一起去掉
+        end = len(lines) - 1
+        while end >= 0 and not lines[end].strip():
+            end -= 1
+        if end >= 0 and lines[end].strip().startswith('```'):
+            lines = lines[:end]
+        return '\n'.join(lines).strip()
+    return text
+
+
+_PAGE_MARK_RE = re.compile(r'^#\s*=====\s*画布：(.*?)\s*=====\s*$', re.MULTILINE)
+
+
+def _split_page_blocks(text: str):
+    """把「多画布拼接视图」切成 [(画布名, yaml 片段), ...]。
+
+    背景（2026-11-04 生产 proto=92 实测）：`_merge_page_summaries()` 把各画布 page_summary
+    用 ``# ===== 画布：<名字> =====`` 注释直接拼成一段文本存进 requirement_summary。
+    这意味着 requirement_summary **不是单个 YAML 文档**，而是 19 份文档首尾相接，
+    每份都从 ``version:`` 重新开始（顶层键重复 19 次）。
+    整份 `yaml.safe_load` 的后果：
+      ① 只要任一段带代码围栏/非法行，整份解析失败 → modules=0 → 阶段3 只拆出 0 个模块；
+      ② 即使侥幸解析成功，重复顶层键也只保留最后一份 → 只有 1 个画布的模块。
+    所以必须先切段、逐段解析、再合并。
+    """
+    if not text:
+        return []
+    marks = list(_PAGE_MARK_RE.finditer(text))
+    if not marks:
+        return []
+    blocks = []
+    for i, m in enumerate(marks):
+        start = m.end()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        blocks.append((m.group(1).strip(), text[start:end]))
+    return blocks
+
+
+def _merge_parsed_docs(docs):
+    """把多份画布 YAML 合并成单一 dict：modules/key_features 等列表累加，标量取首个非空。"""
+    merged = {}
+    for name, doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for key, val in doc.items():
+            if isinstance(val, list):
+                merged.setdefault(key, [])
+                if isinstance(merged[key], list):
+                    merged[key].extend(val)
+            elif isinstance(val, dict):
+                bucket = merged.setdefault(key, {})
+                if isinstance(bucket, dict):
+                    for k2, v2 in val.items():
+                        bucket.setdefault(k2, v2)
+            else:
+                # 标量：保留首个非空值，不覆盖
+                if key not in merged or merged[key] in (None, '', []):
+                    merged[key] = val
+    return merged
+
+
+def _parse_yaml_docs(text: str):
+    """解析可能由多画布拼接而成的 YAML 视图。
+
+    返回 (merged_dict, blocks_info)。blocks_info 记录每段是否解析成功，供上层日志/审计。
+    单文档输入时等价于 _parse_yaml。
+    """
+    raw = text or ''
+    blocks = _split_page_blocks(raw)
+    if not blocks:
+        return None, []
+    info, docs = [], []
+    for name, body in blocks:
+        body_clean = _strip_yaml_fence(body)
+        parsed = _parse_yaml(body_clean)
+        ok = isinstance(parsed, dict)
+        info.append({'page': name, 'ok': ok, 'bytes': len(body_clean)})
+        if ok:
+            parsed.setdefault('_page_name', name)
+            docs.append((name, parsed))
+    if not docs:
+        return None, info
+    return _merge_parsed_docs(docs), info
 
 
 def _parse_yaml(text: str):
@@ -128,14 +286,28 @@ def _parse_yaml(text: str):
         import yaml
         return yaml.safe_load(text)
     except Exception as e:
-        # 容错一：修复「引号半包裹」坏行后重试
+        # 容错一：外层代码围栏（落库内容带 ```yaml 时会导致整份解析失败）
+        stripped = _strip_yaml_fence(text or '')
+        if stripped != (text or ''):
+            try:
+                import yaml
+                result = yaml.safe_load(stripped)
+                if result is not None:
+                    logger.warning('YAML 外层代码围栏已自动剥离后解析成功')
+                    return result
+            except Exception:
+                pass
+        # 容错二：修复「引号半包裹 / 引号内嵌引号」坏行后重试
+        # （基于剥完围栏的文本修，避免围栏行干扰；两者都不需要时返回原文）
+        base = stripped if stripped != (text or '') else (text or '')
         try:
             import yaml
-            repaired = _repair_yaml_text(text)
-            if repaired != text:
+            repaired = _repair_yaml_text(base)
+            if repaired != base:
                 result = yaml.safe_load(repaired)
-                logger.warning('YAML 半包裹引号已自动修复后解析成功')
-                return result
+                if result is not None:
+                    logger.warning('YAML 引号坏行已自动修复后解析成功')
+                    return result
         except Exception:
             pass
         logger.warning(f'YAML 解析失败: {e}')
@@ -162,6 +334,53 @@ def _normalize_evidence_text(value) -> str:
     return re.sub(r'[\s，。；：、,.!?！？:;（）()【】\[\]"""\'''_—-]+', '', text)
 
 
+def _page_has_requirement_annotation(page: dict) -> bool:
+    """判断一个画布是否带有**本期需求增量证据**（用于 G6 未覆盖分母）。
+
+    实测口径（proto=70/71/82/85/88/89/92/93 全量核对）：
+      - ``annotations`` 字段在所有实测任务中恒为空列表，批注实际被并入 ``text``
+        的 ``[便利贴批注]`` 段落，因此必须查 text 而不是只看该字段；
+      - ``visual_artifacts`` **不能整体当判据**：其字段名是 ``artifact_type``（不是 type），
+        且大量条目是 ``ui_screen``（底模线框图外观，按 p0 硬约束 16 不是业务规则）
+        与 ``list_spec``（如各画布重复出现的「HanaKoi V1.10 导航菜单」全局导航清单，
+        不属于任何单个画布的变更）。若整体计入会把全部画布判成"有变更"
+        （实测 proto=93 会算出 63% 误阻断）。
+
+    因此依次检查：
+      1) ``annotations`` 非空；
+      2) ``text`` 含 ``[便利贴批注]`` / ``[需求说明]`` 等段落且段落内确有内容；
+      3) ``visual_artifacts`` 中存在**规则型**结构：annotation / rule_list /
+         state_matrix / data_table / decision_table / interaction_flow，
+         且其 raw_text 有实质长度（排除仅复述页面标题的空壳结构）。
+    """
+    if not isinstance(page, dict):
+        return False
+    if page.get('annotations'):
+        return True
+
+    text = str(page.get('text') or '')
+    for marker in ('[便利贴批注]', '[批注]', '[需求说明]'):
+        idx = text.find(marker)
+        if idx >= 0 and len(text[idx + len(marker):].strip()) >= 8:
+            return True
+
+    _RULE_TYPES = {
+        'annotation', 'rule_list', 'state_matrix', 'data_table',
+        'decision_table', 'interaction_flow', 'pricing_matrix',
+    }
+    for va in (page.get('visual_artifacts') or []):
+        if not isinstance(va, dict):
+            continue
+        atype = str(va.get('artifact_type') or va.get('type') or '').lower()
+        if atype not in _RULE_TYPES:
+            continue
+        if len(str(va.get('raw_text') or '').strip()) >= 10:
+            return True
+        if va.get('rows') or va.get('states') or va.get('steps') or va.get('rules'):
+            return True
+    return False
+
+
 def _repair_source_coverage(all_fused_requirements, valid_pages):
     """Stage-0 G6 确定性覆盖补全。
 
@@ -171,6 +390,25 @@ def _repair_source_coverage(all_fused_requirements, valid_pages):
 
     本函数在 G6 检查前，把"确有 DOM/视觉内容、但未被任何需求标注"的页面，
     归因到内容最匹配的需求上，确保每一页都在融合结果中有来源证据。
+
+    ⚠️ 2026-11-04 修正（proto=93「搜索」模块实测）：
+    ``source_pages`` 里实际混了两种东西：
+      ① 主画布名，如 ``浏览-搜索``；
+      ② 该画布的**页面状态按钮名**，如 未聚焦 / 点击聚焦 / 用户输入 / 搜索结果 / 无结果
+         （融合模型把 tab 按钮当页名写了进来，它们不是独立画布）。
+    一条 fused 需求的 ``interaction`` 本身就是「整个模块在所有状态下的完整需求文本」，
+    所以 source_pages 列多个状态名是正确的、必须保留，不能按"来源页数量"过滤。
+
+    真正有害的是原第 3) 兜底"归因到文本最长的需求"：它会把**与该模块毫无业务关系的
+    其它主画布**（annotations=0、本期无任何变更标注）也追加进 source_pages，
+    而下游阶段1 逐画布结构化正是凭 source_pages 取交集（见 _source_text_for_pages），
+    于是该模块需求被注入到每一个画布，造成跨画布串内容
+    （实测 page5「浏览-创作者信息」摘要混入搜索模块、产出 19 条无关测试点）。
+
+    修正后只保留**有真实内容关联**的归因：
+      1) 需求正文直接包含该页名；
+      2) 已标注页与该页存在父子/包含关系（tab 状态名/子页的典型形态）。
+    原来的"最长需求"兜底改为**只打 ``coverage_unattributed`` 标记、不写入 source_pages**。
     """
     if not isinstance(all_fused_requirements, list) or not valid_pages:
         return
@@ -188,14 +426,14 @@ def _repair_source_coverage(all_fused_requirements, valid_pages):
     if not uncovered:
         return
 
-    repaired = []
+    repaired, weak = [], []
     for page in uncovered:
         pname = page.get('page_name', '')
         norm = _normalize_evidence_text(pname)
         if not norm:
             continue
         target = None
-        # 1) 某条需求文本直接包含该页名
+        # 1) 某条需求文本直接包含该页名（强信号）
         for i, item in enumerate(all_fused_requirements):
             if not isinstance(item, dict):
                 continue
@@ -215,25 +453,26 @@ def _repair_source_coverage(all_fused_requirements, valid_pages):
                         break
                 if target is not None:
                     break
-        # 3) 兜底：归因到文本最长（最可能是被合并的父页）的需求
-        if target is None:
-            best_len = -1
-            for i, item in enumerate(all_fused_requirements):
-                if not isinstance(item, dict):
-                    continue
-                ln = len(json.dumps(item, ensure_ascii=False))
-                if ln > best_len:
-                    best_len = ln
-                    target = i
+        # 3) 无任何内容关联：只打弱覆盖标记，绝不写入 source_pages
+        #    （原"归因到文本最长的需求"会把无关画布全部挂到同一模块上，污染下游画布归属）
         if target is not None and isinstance(all_fused_requirements[target], dict):
             sp = all_fused_requirements[target].setdefault('source_pages', [])
             if pname not in sp:
                 sp.append(pname)
                 repaired.append(pname)
+        else:
+            page['coverage_unattributed'] = True
+            weak.append(pname)
     if repaired:
         logging.getLogger(__name__).info(
             '[STAGE0] 覆盖补全：将 %d 个未被标注的页面归因到融合需求：%s',
             len(repaired), '、'.join(repaired)
+        )
+    if weak:
+        logging.getLogger(__name__).warning(
+            '[STAGE0] 覆盖补全：%d 个页面无同源证据，仅标记 coverage_unattributed，'
+            '不写入 source_pages（避免污染下游画布归属）：%s',
+            len(weak), '、'.join(weak)
         )
 
 
@@ -272,19 +511,498 @@ def _validate_evidence(value, source_text: str) -> bool:
     return all(q in source for q in quotes)
 
 
-def _ordered_union(left, right):
+def _feature_text(item) -> str:
+    """取 key_features 条目的文本。
+
+    兼容两种形态：
+    1. 新格式（p0 已升级为对象）：{'id': 'F-001', 'text': '...', 'involves_api': True, ...}
+    2. 老格式（裸字符串）：'支持新增状态记录'
+    老数据仍在库里，两种都必须能读，否则模块去重签名会失真、
+    甚至把整个 dict 的 repr 当成功能点文本参与相似度计算。
+    """
+    if isinstance(item, dict):
+        for key in ('text', 'title', 'name', 'description'):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ''
+    if item is None:
+        return ''
+    return str(item).strip()
+
+
+def _feature_dedup_key(item):
+    """key_features 去重用的键：新格式优先用稳定 id，老格式用文本。"""
+    if isinstance(item, dict):
+        fid = item.get('id')
+        if isinstance(fid, str) and fid.strip():
+            return ('id', fid.strip())
+        return ('text', _feature_text(item))
+    return ('text', str(item).strip())
+
+
+def _ordered_union(left, right, key=None):
+    """保序并集。传入 key 时按 key 判重（用于 dict 条目，避免 unhashable / 误判）。"""
     result = []
+    seen = set()
     for item in list(left or []) + list(right or []):
-        if item not in result:
-            result.append(item)
+        if key is not None:
+            if not item:
+                continue
+            marker = key(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+        elif item in result:
+            continue
+        result.append(item)
     return result
+
+
+# ---------------------------------------------------------------------------
+# feature_ref / api_ref 事后回填
+# ---------------------------------------------------------------------------
+# 为什么用代码回填而不是让模型透传：
+#   阶段3.3.7 三路合并时，combined 只挑选 id/title/description/priority/source/
+#   pass_criteria 六个字段送给 P7（见 run_design_phase1），feature_ref / api_ref
+#   在这一步就被丢弃，P7 提示词里写再多"必须无损透传"也执行不到。
+#   模型复述 id 也不可靠（会改写/漏写），所以改为在落库前用代码建立
+#   「测试点 ↔ 功能点 / 接口契约」的关联，结果可重复、可解释。
+
+_FEATURE_REF_MIN_SIM = 0.34     # 低于该相似度视为未命中，留空待人工
+_FEATURE_REF_MARGIN = 0.06      # 次优与最优太接近时视为歧义，留空
+
+
+def _ref_tokens(text: str) -> set:
+    """中文 2-gram + 英文/数字串，用于轻量相似度（不依赖 embedding）。"""
+    s = re.sub(r'\s+', '', str(text or ''))
+    if not s:
+        return set()
+    grams = {s[i:i + 2] for i in range(len(s) - 1)}
+    grams |= set(re.findall(r'[A-Za-z0-9_]{2,}', s))
+    return grams
+
+
+def _ref_similarity(a: set, b: set) -> float:
+    """以较短一方为分母的覆盖率，偏好"被测文本包含功能点语义"。"""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _collect_feature_index(summary_data) -> list:
+    """从阶段1 结构化结果收集功能点索引。
+
+    返回 [{'module','id','text','involves_api'}...]；兼容 key_features 为
+    对象（新格式）或裸字符串（老数据）。
+
+    ⚠️ id 全局唯一化：新提示词产出 `M1-F001` 这类带模块前缀的 id；
+    老数据是模块内 `F-001`，两个模块会重复。这里做一次升格，
+    保证返回的 id 在整个 summary 内唯一 —— 否则下游按 id 匹配会跨模块误挂。
+    """
+    index = []
+    if not isinstance(summary_data, dict):
+        return index
+    modules = [m for m in (summary_data.get('modules') or []) if isinstance(m, dict)]
+    seen = {}
+    for m_idx, m in enumerate(modules, 1):
+        mod_name = str(m.get('name') or '').strip()
+        for pos, item in enumerate(m.get('key_features') or [], 1):
+            text = _feature_text(item)
+            if not text:
+                continue
+            fid = ''
+            api_flag = False
+            if isinstance(item, dict):
+                fid = str(item.get('id') or '').strip()
+                api_flag = item.get('involves_api') is True
+            raw_id = fid  # 原始 id（老数据为模块内 F-001，可能跨模块重复）
+            if not fid:
+                # 老数据没有 id：按模块序号+位置生成
+                fid = 'M%d-F%03d' % (m_idx, pos)
+            elif re.fullmatch(r'F-\d+', fid):
+                # 老数据的裸 id（模块内编号）：**一律**加模块前缀升格为全局唯一。
+                # 不能只处理"重复的那些"——首个模块的 F-001 会保留裸 id，
+                # 与后来升格的 id 混用，仍会跨模块误配。
+                num = int(fid.split('-')[1])
+                fid = 'M%d-F%03d' % (m_idx, num)
+            if fid in seen:
+                # 仍冲突（如两个模块同名且序号相同已被占用）：追加序号兜底
+                base = fid
+                n = 2
+                while fid in seen:
+                    fid = '%s#%d' % (base, n)
+                    n += 1
+            seen[fid] = True
+            index.append({'module': mod_name, 'id': fid, 'raw_id': raw_id,
+                          'text': text, 'involves_api': api_flag})
+    return index
+
+
+def _collect_api_index(summary_data, id_map=None) -> list:
+    """从阶段1 结果的 api_contracts 收集接口索引。
+
+    id_map: {原 feature id -> 升格后的唯一 id}，由 _collect_feature_index 的
+    调用方提供，用于把契约里的 feature_ids 同步改成唯一 id（老数据裸 id 会重复）。
+    """
+    out = []
+    if not isinstance(summary_data, dict):
+        return out
+    id_map = id_map or {}
+    for a in (summary_data.get('api_contracts') or []):
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get('id') or '').strip()
+        if not aid:
+            continue
+        fids = []
+        for x in (a.get('feature_ids') or []):
+            k = str(x).strip()
+            if not k:
+                continue
+            # 只映射唯一命中的（映射表里一对多时无法判断，原样保留）
+            mapped = id_map.get(k)
+            fids.append(mapped if isinstance(mapped, str) else k)
+        # 接口自身可检索的文本：路径、触发点、字段名
+        parts = [a.get('path') or '', a.get('trigger') or '', a.get('method') or '']
+        for f in (a.get('request_fields') or []):
+            if isinstance(f, dict):
+                parts.append(str(f.get('name') or ''))
+        for f in (a.get('response_fields') or []):
+            if isinstance(f, dict):
+                parts.append(str(f.get('name') or ''))
+        out.append({'id': aid, 'feature_ids': fids,
+                    'text': ' '.join(x for x in parts if x)})
+    return out
+
+
+def backfill_testpoint_refs(test_points, summary_data, page_name='') -> int:
+    """给测试点回填 feature_ref / api_ref（原地修改，返回回填条数）。
+
+    规则（保守，宁缺勿错）：
+      1. 测试点归属模块与功能点模块不同则不匹配 —— 避免跨模块误挂；
+         模块名取"短的那个包含长的"即视为同模块（兼容「运动连胜」vs「运动连胜-日历」）。
+      2. 相似度 = 以功能点分词语料为分母的覆盖率，取最高分；
+         且必须 >= _FEATURE_REF_MIN_SIM，并且比次优高出 _FEATURE_REF_MARGIN，
+         否则视为歧义留空（避免为了"每条都有值"而强行乱挂）。
+      3. api_ref 只从 feature_ref 命中且 involves_api=True 的功能点反查，
+         不额外猜测接口。
+    """
+    feats = _collect_feature_index(summary_data)
+    if not feats or not isinstance(test_points, list):
+        return 0
+
+    # 原 id -> 唯一 id 映射：老数据两个模块都有 F-001 时无法判断契约指哪个模块，
+    # 这种重复原 id 不映射（契约里的引用原样保留，不会误挂到某一侧）。
+    raw_counter = {}
+    for f in feats:
+        raw_counter[f.get('raw_id')] = raw_counter.get(f.get('raw_id'), 0) + 1
+    id_map = {}
+    for f in feats:
+        rid = f.get('raw_id')
+        if rid and rid != f['id'] and raw_counter.get(rid) == 1:
+            id_map[rid] = f['id']
+    apis = _collect_api_index(summary_data, id_map)
+
+    feat_tokens = [(f, _ref_tokens(f['text']), _ref_tokens(f['text']) | {f['id'].lower()})
+                   for f in feats]
+    # feature id -> api ids
+    api_by_feature = {}
+    for a in apis:
+        for fid in a['feature_ids']:
+            api_by_feature.setdefault(fid, []).append(a['id'])
+
+    def same_module(tp_module, feat_module):
+        """判断测试点模块与功能点模块是否同一模块。
+
+        ⚠️ 不能简单用"互相包含"：实测存在「运动连胜」与「运动连胜-日历」这种
+        父子关系模块，且两个模块的 feature id 都从 F-001 起 —— 互相包含会把
+        子模块的测试点挂到父模块同名 id 的功能点上，产生跨模块误挂。
+        规则：归一化后完全相等 → 同模块；一方为空 → 不限制；
+        一方是另一方以固定分隔符切分后的完整前缀/子项 → 才算同族。
+        """
+        def _n(x):
+            return re.sub(r'[\s_/、,，。|·]+', '', str(x or ''))
+
+        a, b = _n(tp_module), _n(feat_module)
+        if not a or not b or a == b:
+            return True
+        # 以原串（保留 '-'）按分隔符切段，要求段序列前缀一致
+        def _segs(x):
+            return [s for s in re.split(r'[\s\-_/、,，。|·]+', str(x or '')) if s]
+        sa, sb = _segs(tp_module), _segs(feat_module)
+        if not sa or not sb:
+            return False
+        short, long_ = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+        # 只在"短的是长的完整前缀"且短的一方至少 2 段时才认为同族；
+        # 1 段 vs 2 段（如「运动连胜」vs「运动连胜-日历」）属于父子模块，严格区分。
+        return len(short) >= 2 and long_[:len(short)] == short
+
+    filled = 0
+    for tp in test_points:
+        if not isinstance(tp, dict):
+            continue
+        if tp.get('feature_ref') or tp.get('api_ref'):
+            # 模型已经给出（例如降级路径直通），尊重原值
+            continue
+        blob = ' '.join(str(tp.get(k) or '') for k in
+                        ('title', 'description', 'pass_criteria', 'page_path'))
+        t_tokens = _ref_tokens(blob)
+        if not t_tokens:
+            continue
+        tp_mod = tp.get('module')
+
+        def _score(allow_other_modules: bool):
+            out = []
+            for f, f_tokens, f_full in feat_tokens:
+                if not allow_other_modules and not same_module(tp_mod, f['module']):
+                    continue
+                sim = max(_ref_similarity(f_tokens, t_tokens),
+                          _ref_similarity(f_full, t_tokens) * 0.95)
+                if sim > 0:
+                    out.append((sim, f))
+            out.sort(key=lambda x: -x[0])
+            return out
+
+        # 先在本模块内找；找不到再放开模块限制（P7 合并会重写 module 字段，
+        # 实测存在"日历模块的测试点被标成目标模块"的错标，严格按模块过滤会整批漏配）。
+        scored = _score(allow_other_modules=False)
+        relaxed = False
+        if not scored or scored[0][0] < _FEATURE_REF_MIN_SIM:
+            wider = _score(allow_other_modules=True)
+            if wider and (not scored or wider[0][0] > scored[0][0] + _FEATURE_REF_MARGIN):
+                scored, relaxed = wider, True
+        if not scored:
+            continue
+        scored.sort(key=lambda x: -x[0])
+        best_sim, best = scored[0]
+        second = scored[1][0] if len(scored) > 1 else 0.0
+        if best_sim < _FEATURE_REF_MIN_SIM:
+            continue
+        if best_sim - second < _FEATURE_REF_MARGIN:
+            # 歧义：留空，交给人工/前端提示，不硬挂
+            tp['_ref_ambiguous'] = [
+                {'id': f['id'], 'sim': round(s, 3)} for s, f in scored[:3]
+            ]
+            continue
+        tp['feature_ref'] = [best['id']]
+        tp['_feature_ref_sim'] = round(best_sim, 3)
+        # 记录功能点所属模块，便于前端/审计发现 P7 的 module 错标
+        tp['_feature_ref_module'] = best['module']
+        if relaxed:
+            tp['_feature_ref_relaxed'] = True
+        if best['involves_api']:
+            api_ids = api_by_feature.get(best['id']) or []
+            if api_ids:
+                tp['api_ref'] = api_ids
+        filled += 1
+    return filled
+
+
+# ---------------------------------------------------------------------------
+# P0 占比收敛（代码侧硬约束）
+# ---------------------------------------------------------------------------
+# 为什么必须在代码里做：p7 提示词写了「P0 占比 ≤15%」，但没有可靠的执行体
+# —— 实测同一批数据 P0 到 25%~45%，模型会为了"重要"给几乎所有点打 P0。
+# 质量检查 _code_quality_check 里的 C5 也只做 WARNING 检测、不修正数据。
+# 因此改为落库前按配额下调，并把每次降级写进审计字段，人工可复核。
+
+P0_RATIO_LIMIT = 0.15      # P0 上限（与 p7 硬约束 4 / 质量检查 C5 保持一致）
+P0_MIN_KEEP = 3            # 小批量时至少保留的 P0 条数（避免 5 条用例被压成 0 条 P0）
+
+
+def _priority_rank(v) -> int:
+    """P0=0 / P1=1 / P2=2；非法值（如 'P'、空）按 P1 处理。"""
+    s = str(v or '').strip().upper()
+    return {'P0': 0, 'P1': 1, 'P2': 2}.get(s, 1)
+
+
+_CAT_SYNONYMS = {
+    'main_flow': 'main_flow', 'branch_flow': 'branch_flow', 'boundary': 'boundary',
+    'exception': 'exception', 'permission': 'permission', 'ui': 'UI',
+    'performance': 'performance', 'compatibility': 'UI', '兼容': 'UI',
+    '功能': 'main_flow', '主流程': 'main_flow', '边界': 'boundary',
+    '异常': 'exception', '权限': 'permission', '性能': 'performance',
+}
+
+
+def _infer_category(tp) -> str:
+    """推断 category，优先用 type/category 的显式值，其次按标题关键词判定。
+
+    ⚠️ 历史 bug：原实现只查中文 `type`（功能/边界/异常），而 p2 实际输出英文
+    `category` 或英文 `type`，映射全部落空 → 统一回落到 `main_flow`/`branch_flow`，
+    导致 boundary/exception/permission/UI 被整体吞掉（实测某画布 6 类退化到 2 类）。
+    """
+    if not isinstance(tp, dict):
+        return 'branch_flow'
+
+    def _try(v):
+        k = str(v or '').strip()
+        if not k:
+            return None
+        direct = _CAT_SYNONYMS.get(k) or _CAT_SYNONYMS.get(k.lower())
+        if direct:
+            return direct
+        # 兼容「边界值测试」「异常场景」这类带修饰的写法
+        for syn, cat in _CAT_SYNONYMS.items():
+            if syn and syn in k:
+                return cat
+        return None
+
+    for key in ('category', 'type', 'tp_type'):
+        got = _try(tp.get(key))
+        if got:
+            return got
+
+    # 标题/描述关键词兜底（顺序即优先级：越"专"越先判）
+    blob = ' '.join(str(tp.get(k) or '') for k in ('title', 'description'))
+    # 否定式先剔除：「布局无异常」「不出现报错」这类不是在测异常
+    NEG = ('无异常', '没有异常', '无报错', '不报错', '无错误', '不出现错误',
+           '无崩溃', '不崩溃', '无失败', '不失败')
+    for n in NEG:
+        blob = blob.replace(n, '')
+    RULES = [
+        ('permission', ('权限', '登录态', '会员', '非会员', 'VIP', '越权', '角色', '未登录', '付费')),
+        ('exception', ('异常', '断网', '弱网', '超时', '失败', '重试', '中断', '崩溃',
+                       '错误', '无法', '异常处理', '超时重试', '杀进程')),
+        ('boundary', ('边界', '上限', '下限', '最大值', '最小值', '超长', '空值', '为空',
+                      '特殊字符', '字符数', '取值范围', '数量上限', '范围')),
+        ('performance', ('性能', '大数据量', '加载速度', '耗时', '内存', '滚动性能', '并发')),
+        ('UI', ('UI', '样式', '布局', '文案', '图标', '动画', '适配', '屏', '视觉', '展示正常', '截断')),
+    ]
+    for cat, words in RULES:
+        if any(w in blob for w in words):
+            return cat
+
+    return 'main_flow' if str(tp.get('priority', '')).upper() == 'P0' else 'branch_flow'
+
+
+def ensure_pass_criteria(test_points) -> dict:
+    """兜底补齐空 pass_criteria，避免「假覆盖」测试点落库（原地修改）。
+
+    背景：P7 输出可能解析失败（实测有 YAML 引号未闭合导致整份 JSON 丢弃），
+    此时 workflow 会 `final_tps = deduped` 降级使用合并前的输入；而 P5 风险扩展点
+    历史上不带 pass_criteria，降级路径就把空判据原样写库了 —— 这类测试点在
+    Bug 存在时同样会通过（假覆盖）。
+
+    策略（不编造业务断言，只做可信推导）：
+      1. 已有非空 pass_criteria → 保留
+      2. 否则若 description 里含可观测片段（「展示/提示/跳转/返回/变为/出现」等），
+         取包含这些词的句子作为判据
+      3. 都没有 → 标记 `_criteria_missing=True`，并写一句明确的缺口说明，
+         **不伪造**「页面正常」这类看似可判伪的句子，交由人工补
+    """
+    audit = {'total': 0, 'filled_from_desc': 0, 'still_missing': []}
+    if not isinstance(test_points, list):
+        return audit
+
+    OBSERVABLE = ('展示', '显示', '提示', '跳转', '进入', '返回', '出现', '消失',
+                  '变为', '变为0', 'Toast', 'toast', '文案', '数值', '字段',
+                  '报错', '错误码', '状态码', '刷新', '置灰', '不可点击')
+    PLACEHOLDER = ('见描述', '同上', '略', 'TBD', '无', '-', '—')
+
+    for t in test_points:
+        if not isinstance(t, dict):
+            continue
+        audit['total'] += 1
+        pc = str(t.get('pass_criteria') or '').strip()
+        if pc and pc not in PLACEHOLDER:
+            continue
+
+        desc = str(t.get('description') or '').strip()
+        picked = ''
+        if desc:
+            # 按中英文句号/分号切句，取第一句含可观测词的
+            for seg in re.split(r'(?<=[。；;.!?！？\n])', desc):
+                seg = seg.strip().rstrip('。；;')
+                if seg and any(k in seg for k in OBSERVABLE):
+                    picked = seg
+                    break
+        if picked:
+            t['pass_criteria'] = picked
+            t['_criteria_filled_from'] = 'description'
+            audit['filled_from_desc'] += 1
+        else:
+            # 不伪造判据：明确标出缺口，供前端/人工补
+            t['pass_criteria'] = (
+                '【判据缺失·待人工补充】本测试点未产出可观测判据，'
+                '在缺陷存在时可能无法判伪，需补充具体页面/元素/数值/接口断言。'
+            )
+            t['_criteria_missing'] = True
+            audit['still_missing'].append({
+                'id': t.get('id'), 'title': (t.get('title') or '')[:60]})
+    return audit
+
+
+def enforce_p0_ratio(test_points, limit=P0_RATIO_LIMIT, min_keep=P0_MIN_KEEP) -> dict:
+    """把 P0 占比压到 limit 以内（原地修改，返回审计信息）。
+
+    保护顺序（越靠前越优先保留为 P0）：
+      1. category == main_flow（核心主流程）
+      2. status == active / blocked 无关；source 含 risk 或 pci 的视为风险驱动，稍后降级
+      3. 其余按原顺序
+    只下调 P0 -> P1，不动 P1/P2，也不改 description/pass_criteria。
+    """
+    audit = {'before': 0, 'after': 0, 'limit': limit, 'demoted': []}
+    if not isinstance(test_points, list) or not test_points:
+        return audit
+
+    tps = [t for t in test_points if isinstance(t, dict)]
+    total = len(tps)
+    if total == 0:
+        return audit
+
+    p0_idx = [i for i, t in enumerate(tps)
+              if str(t.get('priority') or '').strip().upper() == 'P0']
+    audit['before'] = len(p0_idx)
+
+    # 配额优先：先按比例算，向下取整（保证不超上限）；
+    # min_keep 只在"按比例会压到 0 条"的极小批量下兜底，
+    # 否则 14 条 × 15% = 2.1 → 取 2 条，不应被 min_keep=3 抬到 3 条而破坏 15% 上限。
+    quota = int(total * limit)
+    if quota <= 0:
+        allowed = min(min_keep, len(p0_idx))
+    else:
+        allowed = min(quota, len(p0_idx))
+    if len(p0_idx) <= allowed:
+        audit['after'] = len(p0_idx)
+        return audit
+
+    # 排序：main_flow 优先保留；其次非 risk/pci 来源（基础功能点）优先；
+    # 最后按原顺序（保持稳定）
+    def _keep_score(i):
+        t = tps[i]
+        cat = str(t.get('category') or '').strip().lower()
+        src = [str(s).lower() for s in (t.get('source') or [])]
+        return (0 if cat == 'main_flow' else 1,
+                1 if ('risk' in src or 'pci' in src) else 0,
+                i)
+
+    keep = set(sorted(p0_idx, key=_keep_score)[:allowed])
+    for i in p0_idx:
+        if i in keep:
+            continue
+        t = tps[i]
+        t['priority'] = 'P1'
+        t['_priority_demoted'] = True
+        t['_priority_demote_reason'] = (
+            'P0 配额收敛：P0 占比超过 %.0f%%（原 %d/%d → 保留 %d 条）'
+            % (limit * 100, len(p0_idx), total, allowed)
+        )
+        audit['demoted'].append({
+            'id': t.get('id'), 'title': (t.get('title') or '')[:60],
+            'category': t.get('category'),
+        })
+
+    audit['after'] = len(keep)
+    return audit
 
 
 def _module_signature(module):
     parts = [
-        module.get('name', ''),
-        module.get('description', ''),
-        *[str(x) for x in module.get('key_features', []) if x],
+        str(module.get('name', '') or ''),
+        str(module.get('description', '') or ''),
+        *[_feature_text(x) for x in module.get('key_features', []) if x],
     ]
     text = _normalize_evidence_text(''.join(parts))
     for word in ('模块', '功能', '新增', '修改', '优化', '修订', '补充', '逻辑', '页面'):
@@ -328,7 +1046,8 @@ def _merge_module_pair(primary, duplicate):
         primary.get('source_locations'), duplicate.get('source_locations')
     )
     merged['key_features'] = _ordered_union(
-        primary.get('key_features'), duplicate.get('key_features')
+        primary.get('key_features'), duplicate.get('key_features'),
+        key=_feature_dedup_key,
     )
 
     merged['source_evidence'] = _ordered_union(
@@ -523,6 +1242,40 @@ def _normalize_pci_dispositions(all_pci: list) -> dict:
     return stats
 
 
+# ---------- 画布精确定位（同名画布修复） ----------
+# 墨刀原型允许多个画布同名（如任务 #105 的 p15/p17 都叫「连胜状态」），
+# 所以 page_name 只能当「显示名」，不能当身份键。下面两个工具把画布标识统一成
+# (page_name, page_no) 二元组：page_no 为 None 表示「所有同名画布」（兼容历史
+# 的批量调用），带上 page_no 时精确定位到唯一一张画布。
+def _norm_page_keys(page_names):
+    """把画布标识集合归一化为 {(page_name, page_no)}。
+
+    入参元素可以是 '连胜状态'（纯名字）或 ('连胜状态', 17)（精确二元组）。
+    """
+    keys = set()
+    for item in (page_names or set()):
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            keys.add((str(item[0]), item[1]))
+        else:
+            keys.add((str(item), None))
+    return keys
+
+
+def _page_key_hit(page_name, page_no, keys) -> bool:
+    """extracted_json 里的一条画布是否命中 keys（精确 page_no 优先，其次纯名字）。"""
+    if not keys:
+        return True
+    name = str(page_name)
+    if (name, page_no) in keys:
+        return True
+    return (name, None) in keys
+
+
+def _page_names_of(keys) -> set:
+    """从 {(name, no)} 里取出纯名字集合（用于只能按名字匹配的 fused 条目）。"""
+    return {name for (name, _no) in (keys or set())}
+
+
 class ModaoWorkflow:
     """墨刀技能工作流编排。"""
 
@@ -596,8 +1349,14 @@ class ModaoWorkflow:
             finish_reason = result['choices'][0].get('finish_reason')
         except Exception:
             pass
+        usage = result.get('usage') or {}
+        p_tokens = usage.get('prompt_tokens', 0)
+        c_tokens = usage.get('completion_tokens', 0)
+        t_tokens = usage.get('total_tokens', 0)
         elapsed = _time.time() - t0
-        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s finish_reason={finish_reason}', flush=True)
+        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s tokens(in={p_tokens},out={c_tokens},total={t_tokens}) finish_reason={finish_reason}', flush=True)
+        if getattr(self, 'prototype', None):
+            _wf_tlog(self.prototype.id, f'[LLM_METRICS] {model_label} role={role_label} in_tok={p_tokens} out_tok={c_tokens} total_tok={t_tokens} p_len={len(prompt)} r_len={len(content)} elapsed={elapsed:.2f}s finish_reason={finish_reason}')
         if return_meta:
             return {'content': content, 'finish_reason': finish_reason}
         return content
@@ -965,8 +1724,15 @@ class ModaoWorkflow:
                 note = f'自动过滤建议：{reason}' if should_filter else ''
                 if should_filter:
                     auto_filtered_names.append(p.get('page_name', ''))
+                _name = _target_name_of(p.get('page_name'))
+                # 同名画布修复：update_or_create 默认只拿 page_name 当唯一键，重读 p17
+                # 「连胜状态」时会误更新到 p15 那一行（两张画布内容被揉进同一行）。
+                # 仅当该名字在本任务下存在多行时，才追加 page_no 精确定位；
+                # 名字唯一时保持原行为，避免页码漂移导致凭空新建行。
+                _same = list(self.prototype.pages.filter(page_name=_name))
+                _hit = next((x for x in _same if x.page_no == p['page_no']), None) if len(_same) > 1 else None
+                _lookup = {'pk': _hit.pk} if _hit is not None else {'page_name': _name}
                 self.prototype.pages.update_or_create(
-                    page_name=_target_name_of(p.get('page_name')),
                     defaults={
                         'page_no': p['page_no'],
                         'parent_name': p.get('parent_name', '') or '',
@@ -981,6 +1747,7 @@ class ModaoWorkflow:
                         'rerun_stages': '',
                         'error_message': '',
                     },
+                    **_lookup,
                 )
                 updated += 1
             self._log(f'单画布重读完成：已更新 {updated} 张画布（{", ".join(_target_names)}），其余画布保持不变')
@@ -1147,12 +1914,33 @@ class ModaoWorkflow:
             p for p in valid_pages
             if _normalize_evidence_text(p.get('page_name')) not in fused_source_pages
         ]
-        uncovered_ratio = len(uncovered_pages) / len(valid_pages) if valid_pages else 0
+        # ⚠️ 2026-11-04：G6 只应统计「本期确实有需求变更、却未被融合需求覆盖」的页面。
+        # 判据是**该页面是否带有需求增量证据**，实测口径如下：
+        #   ① ``annotations`` 字段在全部实测任务（proto=70/71/82/85/88/89/92/93）中恒为空，
+        #      批注实际被并入 ``text`` 的 ``[便利贴批注]`` 段落，因此不能只看该字段；
+        #   ② 不能用 ``visual_artifacts`` 判定 —— 它是视觉结构识别产物（ui_screen 线框图等），
+        #      按 p0 硬约束 16，ui_screen 只是底模外观，既不是业务规则也不是本期新增需求；
+        #      用它当"有变更"会把全部画布都算进来（实测 proto=93 会算出 63% 误阻断）。
+        # 无任何批注证据且被 _repair_source_coverage 打了 coverage_unattributed 的页面，
+        # 视为「本期无需求」，不计入分母。
+        _changed_pages = [
+            p for p in uncovered_pages
+            if _page_has_requirement_annotation(p)
+        ]
+        _no_change_pages = [p for p in uncovered_pages if p not in _changed_pages]
+        if _no_change_pages:
+            logging.getLogger(__name__).info(
+                '[STAGE0] G6：%d 个画布本期无需求批注，不计入未覆盖分母：%s',
+                len(_no_change_pages),
+                '、'.join(p.get('page_name', '') for p in _no_change_pages[:8]),
+            )
+        uncovered_pages_g6 = _changed_pages
+        uncovered_ratio = len(uncovered_pages_g6) / len(valid_pages) if valid_pages else 0
         if dual_fusion and all_fused_requirements and uncovered_ratio > 0.2:
-            uncovered_names = '、'.join(p.get('page_name', '') for p in uncovered_pages[:8])
+            uncovered_names = '、'.join(p.get('page_name', '') for p in uncovered_pages_g6[:8])
             block_reasons.append(
-                f'有 {len(uncovered_pages)} 个页面的内容未被融合需求覆盖：{uncovered_names}，'
-                f'建议检查这些页面是否有效、是否需要重新读取'
+                f'有 {len(uncovered_pages_g6)} 个页面（含本期变更标注）的内容未被融合需求覆盖：'
+                f'{uncovered_names}，建议检查这些页面是否有效、是否需要重新读取'
             )
         extraction_blocked = bool(block_reasons)
         # 部分成功（读取超时但有已读页）：**不算失败**，落库已读部分并提示可继续读取。
@@ -1362,6 +2150,29 @@ class ModaoWorkflow:
         except Exception:
             return set()
 
+    def _target_pages_qs(self):
+        """本次运行真正要处理的画布 QuerySet（**尽量按 id 精确定位**）。
+
+        背景（同名画布 bug）：墨刀原型允许多个画布取同一个名字，例如任务
+        #105 的 p15/p17 都叫「连胜状态」、p16/p18 都叫「目标」、p6/p12 都叫
+        「运动连胜」。因此 ``page_name`` **不是唯一键**，不能当作画布身份使用。
+
+        此前所有调用点都是「先用 page_ids 选出 id → 再降维成 page_name 集合 →
+        最后 filter(page_name__in=名字集合)」，同名画布会被一并命中，导致：
+          · 点 p17「连胜状态」结构化 → p15 被一起重跑、一起推进阶段；
+          · _merge_page_summaries 把两张同名画布的摘要一起拼进全局摘要
+            → 界面上直接出现「两个一样的模块」。
+        这里把身份收敛回 id：画布级独立运行（构造时传了 page_ids）时按 id 精确取；
+        任务级批量运行（无 page_ids）时才退回按名字，保持历史行为。
+        """
+        qs = self.prototype.pages.all()
+        if self.page_ids is not None:
+            return qs.filter(id__in=self.page_ids)
+        sel_names = self._selected_page_names()
+        if sel_names:
+            return qs.filter(page_name__in=sel_names)
+        return qs
+
     def _advance_selected_pages(self, stage, status='done', error=None):
         """A2-b：把任务下所有「已勾选」画布的画布级进度推进到指定阶段。
 
@@ -1369,10 +2180,7 @@ class ModaoWorkflow:
         回退时由回退接口单独调用本方法降级。
         """
         try:
-            selected_names = self._selected_page_names()
-            pages = self.prototype.pages.all()
-            if selected_names:
-                pages = pages.filter(page_name__in=selected_names)
+            pages = self._target_pages_qs()
             for p in pages:
                 # 只在前进时取 max；回退（stage 更小）时由调用方直接赋值
                 if stage >= p.current_stage:
@@ -1519,10 +2327,10 @@ class ModaoWorkflow:
         summary = (summary_text if summary_text is not None else self.prototype.requirement_summary or '').strip()
         if not summary:
             return ''
-        try:
+        # ⚠️ 2026-11-04：多画布拼接视图必须逐段合并解析，整份 safe_load 会失败 → PCI 丢失全局关联视角
+        data, _ = _parse_yaml_docs(summary)
+        if not isinstance(data, dict):
             data = _parse_yaml(summary)
-        except Exception:
-            return ''
         if not isinstance(data, dict):
             return ''
         modules = data.get('modules') or []
@@ -1651,8 +2459,9 @@ class ModaoWorkflow:
         except (TypeError, ValueError):
             return []
         tables = []
+        _keys = _norm_page_keys(page_names) if page_names is not None else None
         for page in data.get('pages') or []:
-            if page_names is not None and page.get('page_name') not in page_names:
+            if _keys is not None and not _page_key_hit(page.get('page_name'), page.get('page_no'), _keys):
                 continue
             for artifact in page.get('visual_artifacts') or []:
                 if not isinstance(artifact, dict) or artifact.get('artifact_type') != 'decision_table':
@@ -1673,8 +2482,9 @@ class ModaoWorkflow:
             return []
         trivial = {'ui', 'annotation'}
         structures = []
+        _keys = _norm_page_keys(page_names) if page_names is not None else None
         for page in data.get('pages') or []:
-            if page_names is not None and page.get('page_name') not in page_names:
+            if _keys is not None and not _page_key_hit(page.get('page_name'), page.get('page_no'), _keys):
                 continue
             for artifact in page.get('visual_artifacts') or []:
                 if not isinstance(artifact, dict) or artifact.get('artifact_type') in trivial:
@@ -1852,8 +2662,9 @@ class ModaoWorkflow:
         self.prototype.status = 'structuring'
         self.prototype.save(update_fields=['status'])
         self._log('开始需求结构化分析（按选中画布子集逐画布独立生成）...')
-        sel_names = self._selected_page_names()
-        pages = list(self.prototype.pages.filter(page_name__in=sel_names)) if sel_names else list(self.prototype.pages.all())
+        # 同名画布修复：统一走 _target_pages_qs()（画布级按 id 精确取），
+        # 不再 filter(page_name__in=...)，否则同名画布会被一起结构化。
+        pages = list(self._target_pages_qs())
         if not pages:
             self._log('没有可选画布，结构化中止')
             return ''
@@ -1877,7 +2688,9 @@ class ModaoWorkflow:
                 self.prototype.save(update_fields=['status', 'requirement_summary'])
                 return self.prototype.requirement_summary
             self._log(f'  ▶ 结构化画布 [{p.page_name}] ...')
-            text = self._source_text_for_pages({p.page_name})
+            # 同名画布修复：带上 page_no 组成精确键，只取「这一张」画布的原文，
+            # 否则 p15/p17 两个「连胜状态」的原文会一起进 LLM，摘要里就出现两个一样的模块。
+            text = self._source_text_for_pages({(p.page_name, p.page_no)})
             prompt = render_prompt(P0_REQUIREMENT_STRUCT, requirement_text=text) + self._kb_suffix()
             out = self._llm(self.analyzer_config, prompt, max_tokens=8000, temperature=0)
             parsed = _parse_yaml(_extract_block(out, 'yaml'))
@@ -1898,8 +2711,8 @@ class ModaoWorkflow:
             if isinstance(parsed, dict):
                 # 逐画布独立：restore 只恢复「当前画布」的权威视觉/决策结构，
                 # 防止把未勾选画布（如会员购买页优化、升级付费-Android）的视觉产物注入本画布摘要。
-                parsed = self._restore_authoritative_decision_tables(parsed, {p.page_name})
-                parsed = self._restore_authoritative_visual_structures(parsed, {p.page_name})
+                parsed = self._restore_authoritative_decision_tables(parsed, {(p.page_name, p.page_no)})
+                parsed = self._restore_authoritative_visual_structures(parsed, {(p.page_name, p.page_no)})
                 parsed, merge_count, invalid_count = _postprocess_requirement_summary(
                     parsed, text
                 )
@@ -1927,16 +2740,30 @@ class ModaoWorkflow:
         return self.prototype.requirement_summary
 
     def _source_text_for_pages(self, page_names: set) -> str:
-        """针对指定画布集合生成结构化输入（阶段1逐画布结构化时使用）。"""
+        """针对指定画布集合生成结构化输入（阶段1逐画布结构化时使用）。
+
+        ⚠️ 2026-11-04 语义澄清：fused 条目的 ``source_pages`` 里混着两类名字——
+          ① 主画布名（如 ``浏览-搜索``）；
+          ② 该画布的**页面状态按钮名**（如 未聚焦 / 点击聚焦 / 用户输入 / 搜索结果 / 无结果）。
+        一条 fused 需求的 ``interaction`` 本身就是「整个模块在所有状态下的完整需求」，
+        所以**不能按"来源页数量"过滤**（那会把整模块需求误杀，导致状态覆盖不全）。
+        画布归属的正确性由阶段0 的 ``_repair_source_coverage`` 保证：
+        它只允许有真实内容关联的页写入 source_pages，无关画布仅打
+        ``coverage_unattributed`` 标记而不再污染该字段。
+        """
         if self.prototype.extracted_json:
             data = json.loads(self.prototype.extracted_json)
             parts = []
+            _keys = _norm_page_keys(page_names)
+            # fused_requirements 的 source_pages 只有名字、没有 page_no，无法区分同名画布，
+            # 这里只能按名字匹配（已知局限）；下面 pages[] 有 page_no，走精确定位。
+            _names = _page_names_of(_keys)
             fused = data.get('fused_requirements') or []
             if fused:
                 fused = [
                     x for x in fused
                     if isinstance(x, dict)
-                    and (page_names & set(str(s) for s in (x.get('source_pages') or [])))
+                    and (_names & set(str(s) for s in (x.get('source_pages') or [])))
                 ]
                 if fused:
                     parts.append(
@@ -1946,7 +2773,7 @@ class ModaoWorkflow:
             for p in data.get('pages', []):
                 if p.get('duplicate_of_page'):
                     continue
-                if p.get('page_name') not in page_names:
+                if not _page_key_hit(p.get('page_name'), p.get('page_no'), _keys):
                     continue
                 anno_str = json.dumps(p.get('annotations', []), ensure_ascii=False) if p.get('annotations') else '[]'
                 va_str = json.dumps(p.get('visual_artifacts', []), ensure_ascii=False) if p.get('visual_artifacts') else '[]'
@@ -1966,10 +2793,10 @@ class ModaoWorkflow:
         此前合并所有历史画布，导致只选一个画布重跑结构化时，全局需求摘要仍显示整个版本。
         未选中画布的 page_summary 仍保留在库中，之后勾选并重跑即重新纳入。
         """
-        pages = list(self.prototype.pages.exclude(page_summary='').exclude(page_summary__isnull=True))
-        sel_names = self._selected_page_names()
-        if sel_names:
-            pages = [p for p in pages if p.page_name in sel_names]
+        # 同名画布修复：用 _target_pages_qs()（画布级按 id 精确取）取代按名字过滤，
+        # 否则点 p17 结构化时，p15 与 p17 两张「连胜状态」的摘要会一起拼进全局摘要
+        # → 界面出现两个一样的模块。
+        pages = list(self._target_pages_qs().exclude(page_summary='').exclude(page_summary__isnull=True))
         if not pages:
             return ''
         blocks = []
@@ -1978,12 +2805,12 @@ class ModaoWorkflow:
         return '\n\n'.join(blocks)
 
     def _converged_conclusions(self) -> list:
-        """读取阶段1已收敛为确定结论的歧义点清单（供阶段2/阶段3避免重复追问）。"""
-        try:
-            import yaml as _yaml
-            data = _yaml.safe_load(self.prototype.requirement_summary or '{}') or {}
-        except Exception:
-            return []
+        """读取阶段1已收敛为确定结论的歧义点清单（供阶段2/阶段3避免重复追问）。
+
+        ⚠️ 2026-11-04：requirement_summary 是多画布拼接视图，整份 safe_load 会失败
+        （中间带代码围栏时直接抛错 → 这里恒返回空，收敛结论全部丢失）。
+        """
+        data, _ = _parse_yaml_docs(self.prototype.requirement_summary or '')
         if not isinstance(data, dict):
             return []
         return data.get('converged_conclusions') or []
@@ -2005,7 +2832,7 @@ class ModaoWorkflow:
         # 画布级隔离：若限定了画布子集（如单画布流水线触发澄清），结构化范围收敛为该画布集合的摘要，
         # 避免把其他画布（如定制mini形象）的摘要作为已确认范围送入当前画布审查。
         if sel_names:
-            pages_to_clarify = list(self.prototype.pages.filter(page_name__in=sel_names))
+            pages_to_clarify = list(self._target_pages_qs())
             summaries = [p.page_summary.strip() for p in pages_to_clarify if (p.page_summary or '').strip()]
             structured = '\n\n'.join(summaries) if summaries else ''
         else:
@@ -2131,7 +2958,8 @@ class ModaoWorkflow:
         self.prototype.clarification_log = out
         # A2-c：澄清清单写回画布时按画布归属隔离（各画布只保留归属于自己的澄清项，防止跨画布串台）
         sel_names = self._selected_page_names()
-        pages = list(self.prototype.pages.filter(page_name__in=sel_names)) if sel_names else list(self.prototype.pages.all())
+        # 同名画布修复：按 id 精确取，避免同名画布一起被写回/一起推进阶段。
+        pages = list(self._target_pages_qs()) if sel_names else list(self.prototype.pages.all())
         all_pages_list = list(self.prototype.pages.all())
         for p in pages:
             if isinstance(clarify_items, list):
@@ -2140,8 +2968,16 @@ class ModaoWorkflow:
                     if not isinstance(item, dict):
                         continue
                     loc = str(item.get('location') or '')
-                    # 匹配画布名或“第N页”
-                    is_match = (p.page_name in loc) or (p.page_no and f'第{p.page_no}页' in loc)
+                    # 同名画布修复：优先按「第N页」精确定位。location 里带了页码但与
+                    # 本画布 page_no 不符时，不再用「同名」兜底，否则 p15/p17 两个
+                    # 「连胜状态」会同时认领同一条澄清项 → 界面出现两个一样的模块。
+                    no_hit = bool(p.page_no) and f'第{p.page_no}页' in loc
+                    numbered_elsewhere = (not no_hit) and ('页' in loc) and any(
+                        f'第{other.page_no}页' in loc
+                        for other in all_pages_list
+                        if other.id != p.id and other.page_no
+                    )
+                    is_match = no_hit or ((not numbered_elsewhere) and p.page_name in loc)
                     # 单画布独立运行模式兜底：如果该条目并未明确指向其他已知画布，也归属当前画布
                     if not is_match and len(pages) == 1:
                         other_names = [other.page_name for other in all_pages_list if other.id != p.id and other.page_name]
@@ -2175,7 +3011,7 @@ class ModaoWorkflow:
         sel_names = self._selected_page_names()
         qs = self.prototype.pages.all()
         if sel_names:
-            qs = qs.filter(page_name__in=sel_names)
+            qs = self._target_pages_qs()
         return qs
 
     def _merge_page_testpoints(self) -> str:
@@ -2360,7 +3196,7 @@ class ModaoWorkflow:
         elif approve_all_selected:
             sel = self._selected_page_names()
             if sel:
-                pages = pages.filter(page_name__in=sel)
+                pages = self._target_pages_qs()
             pages = pages.exclude(page_testcases_json='').exclude(page_testcases_json__isnull=True)
         else:
             return 0
@@ -2523,7 +3359,29 @@ class ModaoWorkflow:
         # 防止 LLM 在长文本中被细节淹没而漏拆相对次要的业务模块。
         # 兜底模式下 summary_text 是「原文 + 澄清结论」的自由文本，不是 YAML，不要拿去解析
         # （否则会把原文里的 "key: value" 行误解析成模块清单）。此时按「无阶段1清单」逻辑走。
-        summary_yaml = {} if summary_is_fallback else (_parse_yaml(_extract_block(summary_text or '', 'yaml')) or {})
+        # ⚠️ 2026-11-04：任务级 summary_text 是「多画布 YAML 拼接视图」，
+        # 必须逐段解析后合并，不能用 _parse_yaml/_extract_block 处理整份
+        # （实测 proto=92：整份解析失败 → expected_names 为空 → 模块拆分退化为自由发挥，
+        #   或只命中某段围栏内的 1 个画布）。
+        if summary_is_fallback:
+            summary_yaml = {}
+        elif page is not None:
+            summary_yaml = _parse_yaml(_extract_block(summary_text or '', 'yaml')) or {}
+        else:
+            merged_summary, _blocks_info = _parse_yaml_docs(summary_text or '')
+            if merged_summary:
+                summary_yaml = merged_summary
+                ok_n = sum(1 for b in _blocks_info if b['ok'])
+                if len(_blocks_info) > 1:
+                    self._log(
+                        f'需求摘要多画布合并视图：{ok_n}/{len(_blocks_info)} 段解析成功，'
+                        f'合并模块 {len(summary_yaml.get("modules") or [])} 个'
+                    )
+                if ok_n < len(_blocks_info):
+                    bad = [b['page'] for b in _blocks_info if not b['ok']]
+                    self._log(f'⚠️ 以下画布摘要解析失败（已跳过，建议重跑①结构化）：{"、".join(bad)}')
+            else:
+                summary_yaml = _parse_yaml(_extract_block(summary_text or '', 'yaml')) or {}
         summary_modules = summary_yaml.get('modules', []) if isinstance(summary_yaml, dict) else []
         expected_names = [m.get('name', '').strip() for m in summary_modules if isinstance(m, dict) and m.get('name')]
         if expected_names:
@@ -2757,7 +3615,13 @@ class ModaoWorkflow:
                         f'模块信息：\n{mod_ctx}\n'
                         f'要求：每个测试点必须是 dict（含 title/type/priority/description/category），数量 5-20 条，'
                         f'基于模块的具体功能，不要泛化。\n'
-                        f'输出格式（直接输出 YAML）：\nmodule: {mod_name}\ntest_points:\n  - id: TP_{mod_name}_001\n    title: ...\n    type: 功能\n    category: main_flow\n    priority: P0\n    description: ...'
+                        f'输出格式（直接输出 YAML）：\nmodule: {mod_name}\ntest_points:\n'
+                        f'  - id: TP_{mod_name}_001\n    title: ...\n    type: <功能/边界/异常/UI/权限/性能/兼容>\n'
+                        f'    category: <main_flow/branch_flow/boundary/exception/permission/UI/performance>\n'
+                        f'    priority: P0\n    description: ...\n'
+                        f'category 必须按场景选：正常路径=main_flow，分支/可选路径=branch_flow，'
+                        f'空/超长/上下限=boundary，断网/超时/失败=exception，'
+                        f'登录态/权益=permission，文案/布局/动画=UI。不要全部写 branch_flow。'
                     ) + page_text_hint
                     try:
                         tp_out2 = self._llm(self.analyzer_config, retry_prompt, max_tokens=6000, temperature=0)
@@ -2772,12 +3636,7 @@ class ModaoWorkflow:
                     # 后处理：LLM 经常漏 category 字段，按 type/priority 推断补全
                     cat = (t.get('category') or '').strip()
                     if not cat:
-                        tp_type = t.get('type', '')
-                        cat_map = {'功能': 'main_flow', '边界': 'boundary',
-                                   '异常': 'exception', 'UI': 'UI', '权限': 'permission',
-                                   '性能': 'performance', '兼容': 'compatibility'}
-                        default = 'main_flow' if str(t.get('priority', '')).upper() == 'P0' else 'branch_flow'
-                        t['category'] = cat_map.get(tp_type, default)
+                        t['category'] = _infer_category(t)
 
                 # 3.3.5 风险识别 (risk)
                 risk_prompt = render_prompt(P5_RISK_IDENTIFY,
@@ -2799,6 +3658,10 @@ class ModaoWorkflow:
                             'description': etp.get('description', ''),
                             'priority': etp.get('priority_hint', 'P1'),
                             'category': ecat,
+                            # 透传功能级判据：此前这里没取 pass_criteria，导致风险扩展点
+                            # 全部以空判据进入 P7；P7 解析失败降级时更是原样落库，
+                            # 产生大量「假覆盖」测试点（历史实测 29% 为空）。
+                            'pass_criteria': etp.get('pass_criteria') or '',
                             'source': ['risk'],
                         })
 
@@ -2889,22 +3752,32 @@ class ModaoWorkflow:
                 if not merge_json:
                     merge_json = _parse_yaml(_extract_block(merge_out, 'yaml')) or {}
                 final_tps = merge_json.get('test_points', []) if isinstance(merge_json, dict) else []
-                # 安全网：若 P7 未按约定返回测试点，但去重后输入非空，则降级使用输入
+                # 安全网：若 P7 未按约定返回测试点，但去重后输入非空，则降级使用输入。
+                # ⚠️ 降级路径会跳过 P7 的合并/去重/补齐，必须把原因写进日志与审计，
+                # 否则「P7 输出解析失败」会静默变成「用例质量下降」，排查时无从下手
+                # （实测：模型输出了未闭合的引号，整份 JSON 被丢弃，降级后 7 条空判据原样落库）。
                 if not final_tps and deduped:
-                    logger.warning(f'模块[{mod_name}] P7 返回空测试点，降级使用去重后输入({len(deduped)}条)')
-                    self._log(f'  模块[{mod_name}] P7 返回空，降级使用去重后输入 {len(deduped)} 条')
+                    parse_failed = not merge_json
+                    logger.warning(
+                        f'模块[{mod_name}] P7 返回空测试点'
+                        f'（{"输出解析失败" if parse_failed else "模型未给出 test_points"}），'
+                        f'降级使用去重后输入({len(deduped)}条)')
+                    self._log(
+                        f'  模块[{mod_name}] P7 {"输出解析失败" if parse_failed else "未返回测试点"}，'
+                        f'降级使用去重后输入 {len(deduped)} 条（本次跳过合并/补齐）')
+                    dedup_audit.append({
+                        'stage': 'p7_fallback', 'module': mod_name,
+                        'reason': 'parse_failed' if parse_failed else 'empty_testpoints',
+                        'input_count': len(deduped),
+                        'raw_len': len(merge_out or ''),
+                        'raw_head': (merge_out or '')[:200],
+                    })
                     final_tps = deduped
                 for t in final_tps:
                     t['module'] = mod_name
                     # P7 合并后也补全 category（PCI 扩展点经常漏填）
-                    cat = (t.get('category') or '').strip()
-                    if not cat:
-                        tp_type = t.get('type', '')
-                        cat_map = {'功能': 'main_flow', '边界': 'boundary',
-                                   '异常': 'exception', 'UI': 'UI', '权限': 'permission',
-                                   '性能': 'performance', '兼容': 'compatibility'}
-                        default = 'main_flow' if str(t.get('priority', '')).upper() == 'P0' else 'branch_flow'
-                        t['category'] = cat_map.get(tp_type, default)
+                    if not (t.get('category') or '').strip():
+                        t['category'] = _infer_category(t)
                 all_final_tps.extend(final_tps)
                 logger.info(f'模块[{mod_name}] 三路合并：输入{len(combined)} 去重{dedup_count} 最终{len(final_tps)}')
                 self._log(f'  模块[{mod_name}] 合并完成：{len(final_tps)} 测试点')
@@ -3065,6 +3938,34 @@ class ModaoWorkflow:
         # 第一段产物落库（测试点合并完成，等待人工确认）
         if page is not None:
             # 单画布模式：把该画布的测试点写入 page.page_testpoints_json
+            # 回填 feature_ref / api_ref（P7 合并会丢这两列，只能事后用代码建立关联）
+            try:
+                _sum_for_ref = _parse_yaml(_extract_block(page.page_summary or '', 'yaml')) or {}
+                _n = backfill_testpoint_refs(all_final_tps, _sum_for_ref, page.page_name)
+                self._log(f'  追溯回填：{_n}/{len(all_final_tps)} 条测试点已关联功能点/接口')
+            except Exception as _e:
+                logger.warning(f'feature_ref 回填失败（不影响主流程）: {_e}')
+            # pass_criteria 兜底补齐（先补判据，再收敛优先级）
+            try:
+                _pc = ensure_pass_criteria(all_final_tps)
+                if _pc['filled_from_desc'] or _pc['still_missing']:
+                    self._log('  判据兜底：从描述补齐 %d 条，仍缺失 %d 条'
+                              % (_pc['filled_from_desc'], len(_pc['still_missing'])))
+                    dedup_audit.append({'stage': 'pass_criteria', 'page': page.page_name,
+                                        'filled_from_desc': _pc['filled_from_desc'],
+                                        'still_missing': _pc['still_missing']})
+            except Exception as _e:
+                logger.warning(f'pass_criteria 兜底失败（不影响主流程）: {_e}')
+            # P0 占比收敛（画布级：按本画布全部测试点计算配额）
+            try:
+                _pa = enforce_p0_ratio(all_final_tps)
+                if _pa['demoted']:
+                    self._log(
+                        '  P0 配额收敛：%d → %d 条（上限 %.0f%%），降级 %d 条'
+                        % (_pa['before'], _pa['after'], _pa['limit'] * 100, len(_pa['demoted'])))
+                    dedup_audit.append({'stage': 'p0_ratio', 'page': page.page_name, **_pa})
+            except Exception as _e:
+                logger.warning(f'P0 配额收敛失败（不影响主流程）: {_e}')
             page.page_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)
             page.mark_stage(3, status='done', log=f'测试点合并完成（{len(all_final_tps)} 条）')
             page.save(update_fields=['page_testpoints_json', 'current_stage', 'stage_status', 'work_log'])
@@ -3075,6 +3976,37 @@ class ModaoWorkflow:
                 'page_name': page.page_name,
                 'phase': 1,
             }
+        # 全局模式同样回填追溯字段（用合并后的 requirement_summary）
+        # ⚠️ 2026-11-04：必须走 _parse_yaml_docs 逐段合并，否则多画布视图只命中 1 个画布，
+        # feature_ref 回填率会被严重低估（实测 proto=92 会只拿到「个人-个人中心」的功能点）。
+        try:
+            _sum_for_ref, _ = _parse_yaml_docs(self.prototype.requirement_summary or '')
+            _sum_for_ref = _sum_for_ref or {}
+            _n = backfill_testpoint_refs(all_final_tps, _sum_for_ref)
+            self._log(f'  追溯回填：{_n}/{len(all_final_tps)} 条测试点已关联功能点/接口')
+        except Exception as _e:
+            logger.warning(f'feature_ref 回填失败（不影响主流程）: {_e}')
+        # pass_criteria 兜底补齐（任务级）
+        try:
+            _pc = ensure_pass_criteria(all_final_tps)
+            if _pc['filled_from_desc'] or _pc['still_missing']:
+                self._log('  判据兜底：从描述补齐 %d 条，仍缺失 %d 条'
+                          % (_pc['filled_from_desc'], len(_pc['still_missing'])))
+                dedup_audit.append({'stage': 'pass_criteria', 'scope': 'prototype',
+                                    'filled_from_desc': _pc['filled_from_desc'],
+                                    'still_missing': _pc['still_missing']})
+        except Exception as _e:
+            logger.warning(f'pass_criteria 兜底失败（不影响主流程）: {_e}')
+        # P0 占比收敛（任务级：按全部模块合计计算配额）
+        try:
+            _pa = enforce_p0_ratio(all_final_tps)
+            if _pa['demoted']:
+                self._log(
+                    '  P0 配额收敛：%d → %d 条（上限 %.0f%%），降级 %d 条'
+                    % (_pa['before'], _pa['after'], _pa['limit'] * 100, len(_pa['demoted'])))
+                dedup_audit.append({'stage': 'p0_ratio', 'scope': 'prototype', **_pa})
+        except Exception as _e:
+            logger.warning(f'P0 配额收敛失败（不影响主流程）: {_e}')
         self.prototype.risks_json = json.dumps(all_risks, ensure_ascii=False)
         self.prototype.pci_json = json.dumps(all_pci, ensure_ascii=False)
         self.prototype.final_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)
