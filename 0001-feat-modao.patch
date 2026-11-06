@@ -1,0 +1,276 @@
+From f75e8c3213403d39bbbd317fafffd5838f2866c5 Mon Sep 17 00:00:00 2001
+From: liuyi <ly0924171@gmail.com>
+Date: Fri, 6 Nov 2026 13:53:53 +0800
+Subject: [PATCH] =?UTF-8?q?feat(modao):=20=E7=94=BB=E5=B8=83=E7=9C=8B?=
+ =?UTF-8?q?=E6=9D=BF=E3=80=8C=E9=9C=80=E9=87=8D=E8=B7=91=E3=80=8D=E6=98=BE?=
+ =?UTF-8?q?=E7=A4=BA=E5=8E=9F=E5=9B=A0=E5=B9=B6=E6=94=AF=E6=8C=81=E4=B8=80?=
+ =?UTF-8?q?=E9=94=AE=E9=87=8D=E8=B7=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+背景：看板只显示三个字「需重跑」，用户无法判断是哪一步失效、为什么失效。
+后端其实已有 rerun_stages，但没有暴露到界面。
+
+- 卡片：需重跑标签支持悬浮查看原因，并在卡片内直接显示中文说明
+  （摘要/澄清变更 → 测试点与冒烟失效；测试点变更 → 冒烟失效；手动回退 → 连续四阶段）
+- 卡片新增「↻ 重跑」按钮：按最小失效阶段自动选择
+  结构化 / 澄清 / 测试设计 / 生成用例，二次确认后提交，只作用于本画布
+- 抽屉顶部同步展示需重跑原因，避免进抽屉后仍然看不到
+- ModaoPageLightSerializer 增加 rerun_stages（数十字节，不影响首屏体积）
+- ModaoPage.mark_stage 与 _advance_selected_pages：重跑成功后清理 <= 当前阶段的
+  rerun_stages，只保留更高阶段并按 1..4 封顶（回退会写入 5/6/7 这类不存在的阶段）；
+  仍有待重跑阶段时保持 needs_rerun，避免标签提前消失或永远清不掉
+- 仅改读取接口与前端展示，无模型字段变更，不需要数据库迁移
+---
+ apps/requirement_analysis/modao_workflow.py   | 19 +++-
+ apps/requirement_analysis/models.py           | 16 ++-
+ apps/requirement_analysis/serializers.py      |  3 +
+ .../requirement-analysis/ModaoCanvasBoard.vue | 97 ++++++++++++++++++-
+ 4 files changed, 128 insertions(+), 7 deletions(-)
+
+diff --git a/apps/requirement_analysis/modao_workflow.py b/apps/requirement_analysis/modao_workflow.py
+index e63e013..4e92b50 100644
+--- a/apps/requirement_analysis/modao_workflow.py
++++ b/apps/requirement_analysis/modao_workflow.py
+@@ -2187,9 +2187,18 @@ class ModaoWorkflow:
+                     p.current_stage = stage
+                 if status:
+                     p.stage_status = status
++                # 与 ModaoPage.mark_stage 保持一致：重跑到某阶段后，
++                # 只保留更高阶段的待重跑标记（超出 1..4 的越界值一并清掉）。
++                # 否则任务级跑完会把 stage_status 直接抹成 done，
++                # 让「冒烟还没重跑」的画布看起来已经没问题。
++                if status == 'done':
++                    pending = sorted(s for s in p.get_rerun_stages() if stage < int(s) <= 4)
++                    p.set_rerun_stages(pending)
++                    if pending:
++                        p.stage_status = 'needs_rerun'
+                 if error is not None:
+                     p.error_message = error
+-                p.save(update_fields=['current_stage', 'stage_status', 'error_message'])
++                p.save(update_fields=['current_stage', 'stage_status', 'error_message', 'rerun_stages'])
+         except Exception as e:
+             logger.warning('[_advance_selected_pages] 同步画布进度失败: %s', e)
+ 
+@@ -2727,7 +2736,7 @@ class ModaoWorkflow:
+             # 画布级独立产物
+             p.page_summary = out or ''
+             p.mark_stage(1, status='done', log=f'结构化完成（{len(out or "")} 字符）')
+-            p.save(update_fields=['page_summary', 'current_stage', 'stage_status', 'work_log'])
++            p.save(update_fields=['page_summary', 'current_stage', 'stage_status', 'work_log', 'rerun_stages'])
+             per_page_summaries.append({'page': p.page_name, 'summary': out or ''})
+             self._log(f'  ✔ 画布 [{p.page_name}] 结构化完成')
+         # 维护全局合并视图：所有已有 page_summary 的画布合并（含本次未参与的）
+@@ -2992,7 +3001,7 @@ class ModaoWorkflow:
+                 log_cnt = 0
+             p.page_clarification = p_out
+             p.mark_stage(2, status='done', log=f'澄清完成（{log_cnt} 项）')
+-            p.save(update_fields=['page_clarification', 'current_stage', 'stage_status', 'work_log'])
++            p.save(update_fields=['page_clarification', 'current_stage', 'stage_status', 'work_log', 'rerun_stages'])
+         self.prototype.status = 'extracted'
+         self.prototype.current_stage = 2
+         self.prototype.save()
+@@ -3968,7 +3977,7 @@ class ModaoWorkflow:
+                 logger.warning(f'P0 配额收敛失败（不影响主流程）: {_e}')
+             page.page_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)
+             page.mark_stage(3, status='done', log=f'测试点合并完成（{len(all_final_tps)} 条）')
+-            page.save(update_fields=['page_testpoints_json', 'current_stage', 'stage_status', 'work_log'])
++            page.save(update_fields=['page_testpoints_json', 'current_stage', 'stage_status', 'work_log', 'rerun_stages'])
+             release_merge_collection(self.session_id)
+             return {
+                 'modules': len(modules),
+@@ -4348,7 +4357,7 @@ class ModaoWorkflow:
+         if page is not None:
+             # 单画布模式：仅推进该画布进度，不落全局字段
+             page.mark_stage(4, status='done', log=f'用例生成完成（{len(all_cases)} 条）')
+-            page.save(update_fields=['current_stage', 'stage_status', 'work_log'])
++            page.save(update_fields=['current_stage', 'stage_status', 'work_log', 'rerun_stages'])
+             self.prototype.status = 'designing'
+             self.prototype.save(update_fields=['status'])
+             self._log(f'画布[{page.page_name}] 用例生成完成！共 {len(all_final_tps)} 测试点 / {len(all_cases)} 用例')
+diff --git a/apps/requirement_analysis/models.py b/apps/requirement_analysis/models.py
+index 5d34b65..240ba60 100644
+--- a/apps/requirement_analysis/models.py
++++ b/apps/requirement_analysis/models.py
+@@ -800,9 +800,23 @@ class ModaoPage(models.Model):
+         self.rerun_stages = json.dumps(sorted(set(int(s) for s in stages)), ensure_ascii=False)
+ 
+     def mark_stage(self, stage, status='done', log=None, error=None):
+-        """统一推进画布级进度。"""
++        """统一推进画布级进度。
++
++        2026-11-06：重跑成功后按阶段清理 rerun_stages（只清 <= stage 的部分），
++        避免「已经重跑过，提示却一直挂着」以及阶段号越累越多。
++        若清理后仍有更高阶段待重跑，则状态继续保持 needs_rerun，
++        让看板标签与真实待办一致（例如重跑测试点后，冒烟仍需重跑）。
++        """
+         self.current_stage = max(self.current_stage, stage)
+         self.stage_status = status
++        if status == 'done':
++            # 只保留「比本次阶段更高、且真实存在」的待重跑阶段。
++            # 回退接口会写入 [N, N+1, N+2, N+3]（N=4 时出现 5/6/7），
++            # 这些越界阶段永远不会被跑到，必须按 1..4 封顶，否则标记清不掉。
++            pending = sorted(s for s in self.get_rerun_stages() if stage < int(s) <= 4)
++            self.set_rerun_stages(pending)
++            if pending:
++                self.stage_status = 'needs_rerun'
+         if log:
+             ts = timezone.now().strftime('%Y-%m-%d %H:%M:%S')
+             self.work_log = (self.work_log or '') + f'[{ts}] {log}\n'
+diff --git a/apps/requirement_analysis/serializers.py b/apps/requirement_analysis/serializers.py
+index 9c3fa8e..3648c69 100644
+--- a/apps/requirement_analysis/serializers.py
++++ b/apps/requirement_analysis/serializers.py
+@@ -467,6 +467,9 @@ class ModaoPageLightSerializer(serializers.ModelSerializer):
+             'selected', 'current_stage', 'stage_status',
+             'screenshot', 'screenshot_segments', 'recognition_note',
+             'work_log', 'error_message', 'text',
++            # 2026-11-06：看板要展示「需重跑」的具体阶段（哪几步失效），
++            # 该字段仅几十字节，放轻量接口里不影响首屏体积。
++            'rerun_stages',
+         ]
+ 
+ 
+diff --git a/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue b/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue
+index 44e1924..7b27db8 100644
+--- a/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue
++++ b/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue
+@@ -97,7 +97,11 @@
+                     <span class="page-no">P{{ p.page_no }}</span>
+                     <span class="page-name">{{ p.page_name || '未命名画布' }}</span>
+                   </div>
+-                  <el-tag :type="stageMeta(p.current_stage, p.stage_status).type" size="small">
++                  <el-tooltip v-if="p.stage_status === 'needs_rerun'"
++                    :content="rerunInfo(p).reason" placement="top">
++                    <el-tag type="warning" size="small">需重跑</el-tag>
++                  </el-tooltip>
++                  <el-tag v-else :type="stageMeta(p.current_stage, p.stage_status).type" size="small">
+                     {{ stageMeta(p.current_stage, p.stage_status).label }}
+                   </el-tag>
+                 </div>
+@@ -106,9 +110,14 @@
+                 <div class="card-meta">
+                   <span>识别摘要：{{ p.recognition_note || '无' }}</span>
+                 </div>
++                <div v-if="p.stage_status === 'needs_rerun'" class="card-rerun">
++                  ⚠ {{ rerunInfo(p).reason }}
++                </div>
+                 <div v-if="p.error_message" class="card-error">⚠ {{ p.error_message }}</div>
+                 <div class="card-actions">
+                   <el-button type="primary" size="small" @click="openCanvas(p)">进入当前阶段</el-button>
++                  <el-button v-if="p.stage_status === 'needs_rerun'" type="warning" size="small"
++                    @click="rerunCanvas(p)">↻ 重跑</el-button>
+                   <el-button size="small" @click="openCanvas(p)">查看产物</el-button>
+                 </div>
+               </el-card>
+@@ -174,6 +183,11 @@
+           :title="`当前阶段：${stageMeta(focused.current_stage, focused.stage_status).label}`"
+           :description="`单画布模式：每点击一次下方按钮只会对「P${focused.page_no} ${focused.page_name || '未命名画布'}」这一个画布生效，不影响其他画布（原型允许同名画布，以 P 页码区分）。`" />
+ 
++        <el-alert v-if="focused.stage_status === 'needs_rerun'" type="warning" :closable="false" show-icon
++          class="rerun-alert"
++          :title="`需重跑：${rerunInfo(focused).reason}`"
++          description="点下方对应阶段按钮重跑本画布；跑完后该标记会自动清除。" />
++
+         <div class="detail-actions">
+           <el-button size="small" :loading="busy" @click="runCanvasStage('struct', focused)">🔧 结构化</el-button>
+           <el-button size="small" :loading="busy" @click="runCanvasStage('clarify', focused)">🔍 澄清</el-button>
+@@ -435,6 +449,77 @@ export default {
+       }
+       return map[stage] || { label: '阶段' + stage, type: 'info' }
+     },
++    /**
++     * 解析「需重跑」的真实原因（2026-11-06）。
++     *
++     * 后端只在两种情况下写 stage_status=needs_rerun：
++     *   ① 画布产物被人工编辑 → rerun_stages 为下游阶段（摘要/澄清变更=[3,4]，测试点变更=[4]）
++     *   ② 画布级回退 → rerun_stages 为 [N, N+1, N+2, N+3] 连续四段
++     * 这里把阶段号翻译成「因为什么、要重跑哪一步」，避免用户只看到三个字「需重跑」。
++     */
++    rerunInfo(p) {
++      const stages = this.parseArr(p && p.rerun_stages)
++        .map(Number).filter(n => n > 0).sort((a, b) => a - b)
++      const stageNames = { 1: '读取', 2: '结构化', 3: '澄清', 4: '用例' }
++      if (!stages.length) {
++        return { reason: '上游产物变更，下游内容基于旧内容，建议重跑', action: 'design', stages }
++      }
++      // 回退特征：连续四个阶段
++      const isRollback = stages.length === 4
++        && stages.every((s, i) => i === 0 || s === stages[i - 1] + 1)
++      if (isRollback) {
++        const from = stages[0]
++        return {
++          reason: `手动回退到「${stageNames[from] || ('阶段' + from)}」，该画布需重新跑到用例`,
++          action: this.actionOfStage(from),
++          stages,
++        }
++      }
++      if (stages.includes(3)) {
++        return {
++          reason: '摘要或澄清已修改，测试点与冒烟基于旧内容，需重跑测试设计',
++          action: 'design',
++          stages,
++        }
++      }
++      if (stages.includes(4)) {
++        return {
++          reason: '测试点已修改，冒烟基于旧内容，需重新生成用例/冒烟',
++          action: 'generate-cases',
++          stages,
++        }
++      }
++      return {
++        reason: '上游产物变更，下游内容基于旧内容，建议重跑',
++        action: this.actionOfStage(stages[0]),
++        stages,
++      }
++    },
++    actionOfStage(stage) {
++      return ({ 1: 'struct', 2: 'clarify', 3: 'design', 4: 'generate-cases' })[Number(stage)] || 'design'
++    },
++    /** 一键重跑「需重跑」画布：按最小失效阶段选对应动作，跑完后端会自动清掉标记 */
++    async rerunCanvas(p) {
++      const info = this.rerunInfo(p)
++      const actionLabel = {
++        struct: '结构化', clarify: '澄清', design: '测试设计', 'generate-cases': '生成用例/冒烟',
++      }[info.action] || info.action
++      try {
++        await this.$confirm(
++          `将重跑画布「${this.canvasLabel(p)}」的【${actionLabel}】阶段。\n\n` +
++          `原因：${info.reason}\n\n` +
++          '重跑会按当前最新内容重新生成该阶段产物（覆盖旧结果），是否继续？',
++          '重跑确认',
++          { type: 'warning', confirmButtonText: '开始重跑', cancelButtonText: '取消' }
++        )
++      } catch (e) {
++        return
++      }
++      const ok = await this.runCanvasStage(info.action, p)
++      if (ok) {
++        this.$message.success(`已提交【${actionLabel}】重跑，完成后「需重跑」标记会自动消失`)
++      }
++    },
+     parseArr(s) {
+       if (!s) return []
+       try {
+@@ -788,6 +873,16 @@ export default {
+     .page-name { font-weight: 600; font-size: 14px; }
+     .card-progress { margin: 10px 0 6px; }
+     .card-meta { font-size: 12px; color: #909399; }
++    .card-rerun {
++      font-size: 12px;
++      line-height: 1.6;
++      color: #e6a23c;
++      background: #fdf6ec;
++      border: 1px solid #faecd8;
++      border-radius: 4px;
++      padding: 4px 8px;
++      margin-top: 6px;
++    }
+     .card-error { font-size: 12px; color: #f56c6c; margin: 6px 0; }
+     .card-actions { display: flex; gap: 8px; margin-top: 8px; }
+   }
+-- 
+2.55.0.windows.3
+
