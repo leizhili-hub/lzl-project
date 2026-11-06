@@ -1,0 +1,326 @@
+From 30fd45eb4b5f5d6b9532e20bfc1a7be0969b0e60 Mon Sep 17 00:00:00 2001
+From: liuyi <ly0924171@gmail.com>
+Date: Fri, 23 Oct 2026 17:59:16 +0800
+Subject: [PATCH] =?UTF-8?q?fix(modao):=20=E4=BF=AE=E5=A4=8D=E7=94=BB?=
+ =?UTF-8?q?=E5=B8=83=E7=BA=A7=E7=BB=93=E6=9E=84=E5=8C=96/=E6=BE=84?=
+ =?UTF-8?q?=E6=B8=85=E6=97=B6=E5=90=8C=E5=90=8D=E7=94=BB=E5=B8=83=E4=BA=92?=
+ =?UTF-8?q?=E7=9B=B8=E6=B1=A1=E6=9F=93=E5=AF=BC=E8=87=B4=E7=9A=84=E9=87=8D?=
+ =?UTF-8?q?=E5=A4=8D=E6=A8=A1=E5=9D=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+墨刀原型允许多个画布同名（如任务 #105 的 P15/P17 都叫「连胜状态」），
+page_name 不是唯一键。此前各阶段一律「page_ids -> page_name 集合 ->
+filter(page_name__in=名字)」反查，同名画布被一并命中：
+  - 点 P17 结构化会连带重跑 P15 并一起推进阶段
+  - _merge_page_summaries 把两张同名画布摘要一起拼进全局 requirement_summary
+    -> 界面出现两个一样的模块
+  - _source_text_for_pages 按名字取 extracted_json，同名画布原文一起进 LLM
+    （实测 13781 -> 应为 9501 字符），产物里混入对方画布的模块
+
+改动：
+- 新增 _target_pages_qs()：page_ids 模式按 id 精确定位，无 page_ids 的
+  批量模式仍按名字（行为不变）
+- 新增 _norm_page_keys/_page_key_hit/_page_names_of，把画布标识统一为
+  (page_name, page_no) 二元组精确匹配 extracted_json.pages[]
+- 6 处 filter(page_name__in=...) 改为 _target_pages_qs()
+- 澄清项归属改为「第N页」优先，避免同名画布互相认领同一条澄清项
+- 单画布重读 update_or_create：名字有歧义时追加 page_no 定位
+- 前端抽屉标题加 P{page_no}，让同名画布可区分
+
+不涉及数据库字段变更。实测 page_ids=[1056] 时目标画布仅 P17、
+全局摘要 1 块（修复前 2 块）。
+---
+ apps/requirement_analysis/modao_workflow.py   | 128 ++++++++++++++----
+ .../requirement-analysis/ModaoCanvasBoard.vue |   4 +-
+ 2 files changed, 106 insertions(+), 26 deletions(-)
+
+diff --git a/apps/requirement_analysis/modao_workflow.py b/apps/requirement_analysis/modao_workflow.py
+index 2c5bdcf..8c6a4ec 100644
+--- a/apps/requirement_analysis/modao_workflow.py
++++ b/apps/requirement_analysis/modao_workflow.py
+@@ -523,6 +523,40 @@ def _normalize_pci_dispositions(all_pci: list) -> dict:
+     return stats
+ 
+ 
++# ---------- 画布精确定位（同名画布修复） ----------
++# 墨刀原型允许多个画布同名（如任务 #105 的 p15/p17 都叫「连胜状态」），
++# 所以 page_name 只能当「显示名」，不能当身份键。下面两个工具把画布标识统一成
++# (page_name, page_no) 二元组：page_no 为 None 表示「所有同名画布」（兼容历史
++# 的批量调用），带上 page_no 时精确定位到唯一一张画布。
++def _norm_page_keys(page_names):
++    """把画布标识集合归一化为 {(page_name, page_no)}。
++
++    入参元素可以是 '连胜状态'（纯名字）或 ('连胜状态', 17)（精确二元组）。
++    """
++    keys = set()
++    for item in (page_names or set()):
++        if isinstance(item, (tuple, list)) and len(item) == 2:
++            keys.add((str(item[0]), item[1]))
++        else:
++            keys.add((str(item), None))
++    return keys
++
++
++def _page_key_hit(page_name, page_no, keys) -> bool:
++    """extracted_json 里的一条画布是否命中 keys（精确 page_no 优先，其次纯名字）。"""
++    if not keys:
++        return True
++    name = str(page_name)
++    if (name, page_no) in keys:
++        return True
++    return (name, None) in keys
++
++
++def _page_names_of(keys) -> set:
++    """从 {(name, no)} 里取出纯名字集合（用于只能按名字匹配的 fused 条目）。"""
++    return {name for (name, _no) in (keys or set())}
++
++
+ class ModaoWorkflow:
+     """墨刀技能工作流编排。"""
+ 
+@@ -965,8 +999,15 @@ class ModaoWorkflow:
+                 note = f'自动过滤建议：{reason}' if should_filter else ''
+                 if should_filter:
+                     auto_filtered_names.append(p.get('page_name', ''))
++                _name = _target_name_of(p.get('page_name'))
++                # 同名画布修复：update_or_create 默认只拿 page_name 当唯一键，重读 p17
++                # 「连胜状态」时会误更新到 p15 那一行（两张画布内容被揉进同一行）。
++                # 仅当该名字在本任务下存在多行时，才追加 page_no 精确定位；
++                # 名字唯一时保持原行为，避免页码漂移导致凭空新建行。
++                _same = list(self.prototype.pages.filter(page_name=_name))
++                _hit = next((x for x in _same if x.page_no == p['page_no']), None) if len(_same) > 1 else None
++                _lookup = {'pk': _hit.pk} if _hit is not None else {'page_name': _name}
+                 self.prototype.pages.update_or_create(
+-                    page_name=_target_name_of(p.get('page_name')),
+                     defaults={
+                         'page_no': p['page_no'],
+                         'parent_name': p.get('parent_name', '') or '',
+@@ -981,6 +1022,7 @@ class ModaoWorkflow:
+                         'rerun_stages': '',
+                         'error_message': '',
+                     },
++                    **_lookup,
+                 )
+                 updated += 1
+             self._log(f'单画布重读完成：已更新 {updated} 张画布（{", ".join(_target_names)}），其余画布保持不变')
+@@ -1362,6 +1404,29 @@ class ModaoWorkflow:
+         except Exception:
+             return set()
+ 
++    def _target_pages_qs(self):
++        """本次运行真正要处理的画布 QuerySet（**尽量按 id 精确定位**）。
++
++        背景（同名画布 bug）：墨刀原型允许多个画布取同一个名字，例如任务
++        #105 的 p15/p17 都叫「连胜状态」、p16/p18 都叫「目标」、p6/p12 都叫
++        「运动连胜」。因此 ``page_name`` **不是唯一键**，不能当作画布身份使用。
++
++        此前所有调用点都是「先用 page_ids 选出 id → 再降维成 page_name 集合 →
++        最后 filter(page_name__in=名字集合)」，同名画布会被一并命中，导致：
++          · 点 p17「连胜状态」结构化 → p15 被一起重跑、一起推进阶段；
++          · _merge_page_summaries 把两张同名画布的摘要一起拼进全局摘要
++            → 界面上直接出现「两个一样的模块」。
++        这里把身份收敛回 id：画布级独立运行（构造时传了 page_ids）时按 id 精确取；
++        任务级批量运行（无 page_ids）时才退回按名字，保持历史行为。
++        """
++        qs = self.prototype.pages.all()
++        if self.page_ids is not None:
++            return qs.filter(id__in=self.page_ids)
++        sel_names = self._selected_page_names()
++        if sel_names:
++            return qs.filter(page_name__in=sel_names)
++        return qs
++
+     def _advance_selected_pages(self, stage, status='done', error=None):
+         """A2-b：把任务下所有「已勾选」画布的画布级进度推进到指定阶段。
+ 
+@@ -1369,10 +1434,7 @@ class ModaoWorkflow:
+         回退时由回退接口单独调用本方法降级。
+         """
+         try:
+-            selected_names = self._selected_page_names()
+-            pages = self.prototype.pages.all()
+-            if selected_names:
+-                pages = pages.filter(page_name__in=selected_names)
++            pages = self._target_pages_qs()
+             for p in pages:
+                 # 只在前进时取 max；回退（stage 更小）时由调用方直接赋值
+                 if stage >= p.current_stage:
+@@ -1651,8 +1713,9 @@ class ModaoWorkflow:
+         except (TypeError, ValueError):
+             return []
+         tables = []
++        _keys = _norm_page_keys(page_names) if page_names is not None else None
+         for page in data.get('pages') or []:
+-            if page_names is not None and page.get('page_name') not in page_names:
++            if _keys is not None and not _page_key_hit(page.get('page_name'), page.get('page_no'), _keys):
+                 continue
+             for artifact in page.get('visual_artifacts') or []:
+                 if not isinstance(artifact, dict) or artifact.get('artifact_type') != 'decision_table':
+@@ -1673,8 +1736,9 @@ class ModaoWorkflow:
+             return []
+         trivial = {'ui', 'annotation'}
+         structures = []
++        _keys = _norm_page_keys(page_names) if page_names is not None else None
+         for page in data.get('pages') or []:
+-            if page_names is not None and page.get('page_name') not in page_names:
++            if _keys is not None and not _page_key_hit(page.get('page_name'), page.get('page_no'), _keys):
+                 continue
+             for artifact in page.get('visual_artifacts') or []:
+                 if not isinstance(artifact, dict) or artifact.get('artifact_type') in trivial:
+@@ -1852,8 +1916,9 @@ class ModaoWorkflow:
+         self.prototype.status = 'structuring'
+         self.prototype.save(update_fields=['status'])
+         self._log('开始需求结构化分析（按选中画布子集逐画布独立生成）...')
+-        sel_names = self._selected_page_names()
+-        pages = list(self.prototype.pages.filter(page_name__in=sel_names)) if sel_names else list(self.prototype.pages.all())
++        # 同名画布修复：统一走 _target_pages_qs()（画布级按 id 精确取），
++        # 不再 filter(page_name__in=...)，否则同名画布会被一起结构化。
++        pages = list(self._target_pages_qs())
+         if not pages:
+             self._log('没有可选画布，结构化中止')
+             return ''
+@@ -1877,7 +1942,9 @@ class ModaoWorkflow:
+                 self.prototype.save(update_fields=['status', 'requirement_summary'])
+                 return self.prototype.requirement_summary
+             self._log(f'  ▶ 结构化画布 [{p.page_name}] ...')
+-            text = self._source_text_for_pages({p.page_name})
++            # 同名画布修复：带上 page_no 组成精确键，只取「这一张」画布的原文，
++            # 否则 p15/p17 两个「连胜状态」的原文会一起进 LLM，摘要里就出现两个一样的模块。
++            text = self._source_text_for_pages({(p.page_name, p.page_no)})
+             prompt = render_prompt(P0_REQUIREMENT_STRUCT, requirement_text=text) + self._kb_suffix()
+             out = self._llm(self.analyzer_config, prompt, max_tokens=8000, temperature=0)
+             parsed = _parse_yaml(_extract_block(out, 'yaml'))
+@@ -1898,8 +1965,8 @@ class ModaoWorkflow:
+             if isinstance(parsed, dict):
+                 # 逐画布独立：restore 只恢复「当前画布」的权威视觉/决策结构，
+                 # 防止把未勾选画布（如会员购买页优化、升级付费-Android）的视觉产物注入本画布摘要。
+-                parsed = self._restore_authoritative_decision_tables(parsed, {p.page_name})
+-                parsed = self._restore_authoritative_visual_structures(parsed, {p.page_name})
++                parsed = self._restore_authoritative_decision_tables(parsed, {(p.page_name, p.page_no)})
++                parsed = self._restore_authoritative_visual_structures(parsed, {(p.page_name, p.page_no)})
+                 parsed, merge_count, invalid_count = _postprocess_requirement_summary(
+                     parsed, text
+                 )
+@@ -1931,12 +1998,16 @@ class ModaoWorkflow:
+         if self.prototype.extracted_json:
+             data = json.loads(self.prototype.extracted_json)
+             parts = []
++            _keys = _norm_page_keys(page_names)
++            # fused_requirements 的 source_pages 只有名字、没有 page_no，无法区分同名画布，
++            # 这里只能按名字匹配（已知局限）；下面 pages[] 有 page_no，走精确定位。
++            _names = _page_names_of(_keys)
+             fused = data.get('fused_requirements') or []
+             if fused:
+                 fused = [
+                     x for x in fused
+                     if isinstance(x, dict)
+-                    and (page_names & set(str(s) for s in (x.get('source_pages') or [])))
++                    and (_names & set(str(s) for s in (x.get('source_pages') or [])))
+                 ]
+                 if fused:
+                     parts.append(
+@@ -1946,7 +2017,7 @@ class ModaoWorkflow:
+             for p in data.get('pages', []):
+                 if p.get('duplicate_of_page'):
+                     continue
+-                if p.get('page_name') not in page_names:
++                if not _page_key_hit(p.get('page_name'), p.get('page_no'), _keys):
+                     continue
+                 anno_str = json.dumps(p.get('annotations', []), ensure_ascii=False) if p.get('annotations') else '[]'
+                 va_str = json.dumps(p.get('visual_artifacts', []), ensure_ascii=False) if p.get('visual_artifacts') else '[]'
+@@ -1966,10 +2037,10 @@ class ModaoWorkflow:
+         此前合并所有历史画布，导致只选一个画布重跑结构化时，全局需求摘要仍显示整个版本。
+         未选中画布的 page_summary 仍保留在库中，之后勾选并重跑即重新纳入。
+         """
+-        pages = list(self.prototype.pages.exclude(page_summary='').exclude(page_summary__isnull=True))
+-        sel_names = self._selected_page_names()
+-        if sel_names:
+-            pages = [p for p in pages if p.page_name in sel_names]
++        # 同名画布修复：用 _target_pages_qs()（画布级按 id 精确取）取代按名字过滤，
++        # 否则点 p17 结构化时，p15 与 p17 两张「连胜状态」的摘要会一起拼进全局摘要
++        # → 界面出现两个一样的模块。
++        pages = list(self._target_pages_qs().exclude(page_summary='').exclude(page_summary__isnull=True))
+         if not pages:
+             return ''
+         blocks = []
+@@ -2005,7 +2076,7 @@ class ModaoWorkflow:
+         # 画布级隔离：若限定了画布子集（如单画布流水线触发澄清），结构化范围收敛为该画布集合的摘要，
+         # 避免把其他画布（如定制mini形象）的摘要作为已确认范围送入当前画布审查。
+         if sel_names:
+-            pages_to_clarify = list(self.prototype.pages.filter(page_name__in=sel_names))
++            pages_to_clarify = list(self._target_pages_qs())
+             summaries = [p.page_summary.strip() for p in pages_to_clarify if (p.page_summary or '').strip()]
+             structured = '\n\n'.join(summaries) if summaries else ''
+         else:
+@@ -2131,7 +2202,8 @@ class ModaoWorkflow:
+         self.prototype.clarification_log = out
+         # A2-c：澄清清单写回画布时按画布归属隔离（各画布只保留归属于自己的澄清项，防止跨画布串台）
+         sel_names = self._selected_page_names()
+-        pages = list(self.prototype.pages.filter(page_name__in=sel_names)) if sel_names else list(self.prototype.pages.all())
++        # 同名画布修复：按 id 精确取，避免同名画布一起被写回/一起推进阶段。
++        pages = list(self._target_pages_qs()) if sel_names else list(self.prototype.pages.all())
+         all_pages_list = list(self.prototype.pages.all())
+         for p in pages:
+             if isinstance(clarify_items, list):
+@@ -2140,8 +2212,16 @@ class ModaoWorkflow:
+                     if not isinstance(item, dict):
+                         continue
+                     loc = str(item.get('location') or '')
+-                    # 匹配画布名或“第N页”
+-                    is_match = (p.page_name in loc) or (p.page_no and f'第{p.page_no}页' in loc)
++                    # 同名画布修复：优先按「第N页」精确定位。location 里带了页码但与
++                    # 本画布 page_no 不符时，不再用「同名」兜底，否则 p15/p17 两个
++                    # 「连胜状态」会同时认领同一条澄清项 → 界面出现两个一样的模块。
++                    no_hit = bool(p.page_no) and f'第{p.page_no}页' in loc
++                    numbered_elsewhere = (not no_hit) and ('页' in loc) and any(
++                        f'第{other.page_no}页' in loc
++                        for other in all_pages_list
++                        if other.id != p.id and other.page_no
++                    )
++                    is_match = no_hit or ((not numbered_elsewhere) and p.page_name in loc)
+                     # 单画布独立运行模式兜底：如果该条目并未明确指向其他已知画布，也归属当前画布
+                     if not is_match and len(pages) == 1:
+                         other_names = [other.page_name for other in all_pages_list if other.id != p.id and other.page_name]
+@@ -2175,7 +2255,7 @@ class ModaoWorkflow:
+         sel_names = self._selected_page_names()
+         qs = self.prototype.pages.all()
+         if sel_names:
+-            qs = qs.filter(page_name__in=sel_names)
++            qs = self._target_pages_qs()
+         return qs
+ 
+     def _merge_page_testpoints(self) -> str:
+@@ -2360,7 +2440,7 @@ class ModaoWorkflow:
+         elif approve_all_selected:
+             sel = self._selected_page_names()
+             if sel:
+-                pages = pages.filter(page_name__in=sel)
++                pages = self._target_pages_qs()
+             pages = pages.exclude(page_testcases_json='').exclude(page_testcases_json__isnull=True)
+         else:
+             return 0
+diff --git a/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue b/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue
+index b1483ab..69a3e9a 100644
+--- a/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue
++++ b/frontend/src/views/requirement-analysis/ModaoCanvasBoard.vue
+@@ -167,12 +167,12 @@
+     </el-tabs>
+ 
+     <!-- ============ 单画布详情抽屉 ============ -->
+-    <el-drawer :title="focused && ((focused.parent_name ? (focused.parent_name + ' / ') : '') + (focused.page_name || ('P' + focused.page_no))) + ' · 单画布流水线'"
++    <el-drawer :title="focused && ((focused.parent_name ? (focused.parent_name + ' / ') : '') + 'P' + focused.page_no + ' ' + (focused.page_name || '未命名画布')) + ' · 单画布流水线'"
+       v-model="drawerVisible" size="62%" direction="rtl" @closed="focused = null">
+       <div v-if="focused" class="canvas-detail">
+         <el-alert type="info" :closable="false" show-icon
+           :title="`当前阶段：${stageMeta(focused.current_stage, focused.stage_status).label}`"
+-          :description="`单画布模式：每点击一次下方按钮只会对「${focused.page_name || ('P' + focused.page_no)}」这一个画布生效，不影响其他画布。`" />
++          :description="`单画布模式：每点击一次下方按钮只会对「P${focused.page_no} ${focused.page_name || '未命名画布'}」这一个画布生效，不影响其他画布（原型允许同名画布，以 P 页码区分）。`" />
+ 
+         <div class="detail-actions">
+           <el-button size="small" :loading="busy" @click="runCanvasStage('struct', focused)">🔧 结构化</el-button>
+-- 
+2.55.0.windows.3
+
